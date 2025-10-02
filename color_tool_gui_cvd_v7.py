@@ -1,15 +1,17 @@
 # color_tool_gui_cvd_v7.py
-# Adjustable GUI (Color Vision & Highlight) + automatic data export.
-# AUTOMATIC DATA EXPORT:
-#   • On image open  -> saves BEFORE data beside the source image:
-#       <srcdir>/<name>_before_bits.txt          (rows of 0/1 for BGR bytes)
-#       <srcdir>/<name>_before_pixels.csv        (B,G,R per row)
-#   • On Save (S)    -> saves AFTER data beside the source image:
-#       <srcdir>/<name>_<mode>_after#<n>_bits.txt
-#       <srcdir>/<name>_<mode>_after#<n>_pixels.csv
-#     (# increments each time you save during the session)
+# Resizable, fit-to-window preview + separate control panels.
+# Modes:
+#   • Color Vision: pick type (simulate or assist/daltonize), severity/strength.
+#   • Highlight: HSV isolate/overlay with click-to-pick.
 #
-# NOTE: Quit never saves anything new. Only opening an image (BEFORE) and pressing S (AFTER).
+# Quit never saves. Press 'S' to Save As… (choose name & folder).
+# Full-res processing; preview is scaled to your window.
+#
+# SAVE CHANGE: also writes BEFORE/AFTER RGB CSVs:
+#   <base>_before_pixels.csv  (decimal R,G,B)
+#   <base>_after_pixels.csv   (decimal R,G,B)
+#   <base>_before_binary.csv  (binary-string R,G,B)
+#   <base>_after_binary.csv   (binary-string R,G,B)
 
 import os
 import cv2
@@ -19,9 +21,9 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from typing import Tuple
 
-VERSION_TAG = "CVD GUI v7 (auto BEFORE+AFTER data)"
+VERSION_TAG = "v7"
 
-# ---------- Core helpers: image<->pixels<->binary ----------
+# ---------- Core helpers: image<->pixels<->binary (used for round-trip) ----------
 
 def image_to_pixels(img_bgr: np.ndarray) -> np.ndarray:
     if img_bgr is None or img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
@@ -39,33 +41,44 @@ def binary_to_pixels(buf: bytes, shape: Tuple[int,int,int], dtype=np.uint8) -> n
         raise ValueError(f"Binary buffer has {arr.size} elements; expected {expect}.")
     return arr.reshape((h, w, c))
 
-# ---------- Data export (bits + pixels) ----------
+# ---------- CSV writers (decimal + binary-string) ----------
 
-def write_bits_per_row_txt(u8_bgr: np.ndarray, path_txt: str) -> None:
-    """
-    Writes 0/1 text of the image bytes, one image row per line.
-    Each line length = width * 3 channels * 8 bits.
-    """
-    h, w, c = u8_bgr.shape
-    assert c == 3
-    with open(path_txt, "w", encoding="utf-8") as f:
-        row_bytes = w * 3
-        flat = u8_bgr.reshape(-1).view(np.uint8)
-        for y in range(h):
-            start = y * row_bytes
-            end   = start + row_bytes
-            row = flat[start:end]
-            bits = np.unpackbits(row)  # big-endian bit order
-            # join is much faster than str(list(...))
-            f.write("".join('1' if b else '0' for b in bits.tolist()) + "\n")
+def write_pixels_csv(csv_path: str, rgb: np.ndarray) -> None:
+    """Decimal CSV, rows: 'R,G,B'."""
+    h, w = rgb.shape[:2]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("R,G,B\n")
+        flat = rgb.reshape(-1, 3)
+        for R, G, B in flat:
+            f.write(f"{int(R)},{int(G)},{int(B)}\n")
 
-def write_pixels_csv(u8_bgr: np.ndarray, path_csv: str) -> None:
+def write_binary_csv_bits(csv_path: str, rgb: np.ndarray) -> None:
+    """Binary CSV, rows: 'R,G,B' but each value is an 8-bit binary string."""
+    h, w = rgb.shape[:2]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write("R,G,B\n")
+        flat = rgb.reshape(-1, 3)
+        for R, G, B in flat:
+            f.write(f"{int(R):08b},{int(G):08b},{int(B):08b}\n")
+
+def export_rgb_scale_pair(out_base: str, before_bgr: np.ndarray, after_bgr: np.ndarray) -> None:
     """
-    Writes one pixel per row as "B,G,R" integers.
+    Create 4 files beside the saved image:
+      <base>_before_pixels.csv   (decimal)
+      <base>_after_pixels.csv    (decimal)
+      <base>_before_binary.csv   (8-bit binary strings)
+      <base>_after_binary.csv    (8-bit binary strings)
     """
-    h, w, c = u8_bgr.shape
-    flat = u8_bgr.reshape(-1, c)
-    np.savetxt(path_csv, flat, fmt="%d", delimiter=",")
+    before_rgb = cv2.cvtColor(before_bgr, cv2.COLOR_BGR2RGB)
+    after_rgb  = cv2.cvtColor(after_bgr,  cv2.COLOR_BGR2RGB)
+
+    # Decimal CSVs
+    write_pixels_csv(f"{out_base}_before_pixels.csv", before_rgb)
+    write_pixels_csv(f"{out_base}_after_pixels.csv",  after_rgb)
+
+    # Binary-string CSVs
+    write_binary_csv_bits(f"{out_base}_before_binary.csv", before_rgb)
+    write_binary_csv_bits(f"{out_base}_after_binary.csv",  after_rgb)
 
 # ---------- Highlight (HSV) ----------
 
@@ -94,7 +107,6 @@ def make_mask_hsv(hsv: np.ndarray, hc:int, hr:int, smin:int, smax:int, vmin:int,
 
 def overlay_style(bgr: np.ndarray, mask01: np.ndarray, style:int, bg_dim:float,
                   alpha:float, hue_for_overlay:int, show_mask:bool=False) -> np.ndarray:
-    # style: 0=Keep Only, 1=Dim BG, 2=Overlay (complementary hue)
     if show_mask:
         m8 = np.clip(mask01*255.0, 0, 255).astype(np.uint8)
         return cv2.cvtColor(m8, cv2.COLOR_GRAY2BGR)
@@ -104,7 +116,6 @@ def overlay_style(bgr: np.ndarray, mask01: np.ndarray, style:int, bg_dim:float,
     if style == 1:
         out = bgr.astype(np.float32) * (mask01[...,None] + (1.0 - mask01[...,None])*bg_dim)
         return np.clip(out, 0, 255).astype(np.uint8)
-    # style 2: overlay complementary color
     comp_h = (hue_for_overlay + 90) % 180
     overlay_col = cv2.cvtColor(np.uint8([[[comp_h,255,255]]]), cv2.COLOR_HSV2BGR)[0,0,:].astype(np.float32)
     base = bgr.astype(np.float32)
@@ -208,13 +219,12 @@ CVD_TYPES = [
 
 class ColorToolApp:
     def __init__(self):
-        print(VERSION_TAG)
         self.root = tk.Tk()
         self.root.title(f"Color Tool — Launcher [{VERSION_TAG}]")
         self.root.geometry("560x260")
         self.root.resizable(False, False)
 
-        # PREDEFINE Color-Vision vars (prevents early-callback issues)
+        # Predefine CVD vars so preview can run anytime
         self.var_cvd_type    = tk.StringVar(value=CVD_TYPES[0])
         self.var_view        = tk.StringVar(value="simulate")  # "simulate" or "assist"
         self.var_sev         = tk.IntVar(value=100)
@@ -264,27 +274,13 @@ class ColorToolApp:
         self.h_full, self.w_full = img.shape[:2]
         self.hsv_full = cv2.cvtColor(self.img_full, cv2.COLOR_BGR2HSV)
 
-        # Where to auto-save data (same folder as source image)
-        self.src_dir  = os.path.dirname(path)
-        self.src_name = os.path.splitext(os.path.basename(path))[0]
-        self.save_count = 0  # increments for each AFTER save
-
-        # --- AUTO-SAVE BEFORE data immediately ---
-        try:
-            before_bits   = os.path.join(self.src_dir, f"{self.src_name}_before_bits.txt")
-            before_pixels = os.path.join(self.src_dir, f"{self.src_name}_before_pixels.csv")
-            write_bits_per_row_txt(self.img_full, before_bits)
-            write_pixels_csv(self.img_full, before_pixels)
-        except Exception as e:
-            messagebox.showwarning("Before data not saved", f"Could not write BEFORE data:\n{e}")
-
         self.show_original = False
         self.show_mask = False
         self.last_pick_hsv = None
 
         # Image viewer (Tk Canvas — resizable, fit-to-window)
         self.viewer = tk.Toplevel(self.root)
-        self.viewer.title(f"Image — Fit to Window [{VERSION_TAG}]  (S=Save  O=Original  Space=Mask  Q/Esc=Quit)")
+        self.viewer.title(f"Image — Fit to Window [{VERSION_TAG}]  (S=Save  M=Mask  O=Original  Space=Mask  Q/Esc=Quit)")
         self.viewer.geometry("1000x640")
         self.viewer.minsize(480, 360)
 
@@ -292,8 +288,10 @@ class ColorToolApp:
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self.on_canvas_resize)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
-        self.viewer.bind("<Key-s>", self.on_save)   # also triggers AFTER data export
+        self.viewer.bind("<Key-s>", self.on_save)
         self.viewer.bind("<Key-S>", self.on_save)
+        self.viewer.bind("<Key-m>", self.on_save_mask)
+        self.viewer.bind("<Key-M>", self.on_save_mask)
         self.viewer.bind("<Key-o>", self.on_toggle_orig)
         self.viewer.bind("<Key-O>", self.on_toggle_orig)
         self.viewer.bind("<space>", self.on_toggle_mask)
@@ -305,7 +303,6 @@ class ColorToolApp:
         else:
             self.build_highlight_controls()
 
-        # First draw after windows exist
         self.viewer.after(50, self.update_preview)
 
     # ---------- Color Vision controls ----------
@@ -319,11 +316,9 @@ class ColorToolApp:
         self.type_combo.pack(anchor="w", padx=10)
         self.type_combo.bind("<<ComboboxSelected>>", lambda e: (self._update_subrows(), self.update_preview()))
 
-        # Subtype rows holder
         self.sub_frame = tk.Frame(self.ctrl)
         self.sub_frame.pack(fill="x", padx=10, pady=6)
 
-        # Red–Green subtype row
         self.rg_row = tk.Frame(self.sub_frame)
         tk.Label(self.rg_row, text="Red–Green subtype:").pack(side="left")
         ttk.Radiobutton(self.rg_row, text="Deutan-like", variable=self.var_rg_sub, value="deutan",
@@ -331,7 +326,6 @@ class ColorToolApp:
         ttk.Radiobutton(self.rg_row, text="Protan-like", variable=self.var_rg_sub, value="protan",
                         command=self.update_preview).pack(side="left", padx=6)
 
-        # Anomalous variant row
         self.tri_row = tk.Frame(self.sub_frame)
         tk.Label(self.tri_row, text="Anomalous variant:").pack(side="left")
         ttk.Radiobutton(self.tri_row, text="Deuteranomaly", variable=self.var_tri_variant, value="deutan",
@@ -341,7 +335,6 @@ class ColorToolApp:
         ttk.Radiobutton(self.tri_row, text="Tritanomaly",   variable=self.var_tri_variant, value="tritan",
                         command=self.update_preview).pack(side="left", padx=6)
 
-        # View mode row
         view_row = tk.Frame(self.ctrl)
         view_row.pack(fill="x", padx=10, pady=6)
         tk.Label(view_row, text="View Mode:", font=("Segoe UI", 10, "bold")).pack(side="left")
@@ -350,7 +343,6 @@ class ColorToolApp:
         ttk.Radiobutton(view_row, text="Assist (daltonize)",       variable=self.var_view, value="assist",
                         command=self.update_preview).pack(side="left", padx=6)
 
-        # Severity / Strength
         sliders = tk.Frame(self.ctrl)
         sliders.pack(fill="x", padx=10, pady=6)
         tk.Label(sliders, text="Severity (%) — 0=mild anomaly   100=full -opia / complete",
@@ -363,6 +355,11 @@ class ColorToolApp:
         tk.Label(self.str_row, text="Assist strength (%) — only for Assist:", anchor="w").pack(side="left")
         tk.Scale(self.str_row, variable=self.var_strength, from_=0, to=100, orient="horizontal", length=240,
                  command=lambda _=None: self.update_preview()).pack(side="left")
+
+        info = tk.Label(self.ctrl, fg="#444",
+                        text="Tip: Choose your type, then use Simulate to preview or Assist to recolor.\n"
+                             "S=Save  O=Original  Q/Esc=Quit (in the image window).")
+        info.pack(anchor="w", padx=10, pady=6)
 
         btns = tk.Frame(self.ctrl)
         btns.pack(pady=8)
@@ -393,9 +390,9 @@ class ColorToolApp:
         self.var_smax = tk.IntVar(value=255)
         self.var_vmin = tk.IntVar(value=40)
         self.var_vmax = tk.IntVar(value=255)
-        self.var_style= tk.IntVar(value=1)  # 0 keep, 1 dim, 2 overlay
-        self.var_bgdim= tk.IntVar(value=25) # %
-        self.var_alpha= tk.IntVar(value=70) # %
+        self.var_style= tk.IntVar(value=1)
+        self.var_bgdim= tk.IntVar(value=25)
+        self.var_alpha= tk.IntVar(value=70)
         self.var_soft = tk.IntVar(value=2)
         self.var_morph= tk.IntVar(value=0)
         self.var_invert=tk.IntVar(value=0)
@@ -437,14 +434,25 @@ class ColorToolApp:
                        command=self.update_preview).pack(side="left")
 
         info = tk.Label(self.ctrl, fg="#444",
-                        text="Click the image to pick a color (centers Hue; suggests S/V mins).")
+                        text="Click the image to pick a color (centers Hue; suggests S/V mins).\n"
+                             "Hotkeys in image window: S=Save  M=Save Mask  O=Original  Space=Mask  Q/Esc=Quit")
         info.pack(anchor="w", padx=10, pady=6)
 
         btns = tk.Frame(self.ctrl)
         btns.pack(pady=8)
+        tk.Button(btns, text="Reset", command=self.reset_highlight).pack(side="left", padx=6)
         tk.Button(btns, text="Save (S)", command=self.save_as_dialog).pack(side="left", padx=6)
-        tk.Button(btns, text="Save Mask", command=self.on_save_mask).pack(side="left", padx=6)
+        tk.Button(btns, text="Save Mask (M)", command=self.on_save_mask).pack(side="left", padx=6)
         tk.Button(btns, text="Quit (Q/Esc)", command=self.on_quit).pack(side="left", padx=6)
+
+    def reset_highlight(self):
+        self.var_hc.set(15); self.var_hr.set(18)
+        self.var_smin.set(40); self.var_smax.set(255)
+        self.var_vmin.set(40); self.var_vmax.set(255)
+        self.var_style.set(1); self.var_bgdim.set(25)
+        self.var_alpha.set(70); self.var_soft.set(2); self.var_morph.set(0)
+        self.var_invert.set(0)
+        self.update_preview()
 
     # ---------- Rendering / Preview ----------
 
@@ -480,15 +488,9 @@ class ColorToolApp:
         H = self.canvas.winfo_height()
         if W < 2 or H < 2:
             return
-        try:
-            frame = self.current_processed_full()
-        except Exception as e:
-            self.canvas.delete("all")
-            self.canvas.create_text(10, 10, anchor="nw", fill="white",
-                                    text=f"Error in preview:\n{e}")
-            return
 
-        # Fit-to-window (keep aspect)
+        frame = self.current_processed_full()
+
         scale = min(W / self.w_full, H / self.h_full)
         vw = max(1, int(self.w_full * scale))
         vh = max(1, int(self.h_full * scale))
@@ -501,7 +503,30 @@ class ColorToolApp:
 
         # HUD
         hud = disp.copy()
-        lines = ["S=Save (also writes AFTER data)", "O=Original  Space=Mask  Q/Esc=Quit"]
+        lines = []
+        if self.mode.get() == "cvd":
+            t = self.var_cvd_type.get()
+            mode_txt = "Simulate" if self.var_view.get() == "simulate" else "Assist"
+            sev = self.var_sev.get()
+            lines.append(f"CVD: {t}  Mode: {mode_txt}  Severity: {sev}%")
+            if t == "Red–green color blindness":
+                lines.append(f"Subtype: {'Deutan-like' if self.var_rg_sub.get()=='deutan' else 'Protan-like'}")
+            if t == "Anomalous Trichromacy":
+                var = self.var_tri_variant.get()
+                lines.append(f"Variant: { {'deutan':'Deuteranomaly','protan':'Protanomaly','tritan':'Tritanomaly'}[var] }")
+            if self.var_view.get() == "assist":
+                lines.append(f"Assist strength: {self.var_strength.get()}%")
+            lines.append("S=Save  O=Original  Q/Esc=Quit")
+        else:
+            hc,hr = self.var_hc.get(), self.var_hr.get()
+            smin,smax,vmin,vmax = self.var_smin.get(), self.var_smax.get(), self.var_vmin.get(), self.var_vmax.get()
+            style = ["KeepOnly","DimBG","Overlay"][self.var_style.get()]
+            lines.append(f"Highlight: H {hc}±{hr}  S {smin}-{smax}  V {vmin}-{vmax}  Style {style}  Inv {self.var_invert.get()}")
+            lines.append("Click to pick color.  S=Save  M=Mask  O=Original  Space=Mask  Q/Esc=Quit")
+            if self.last_pick_hsv is not None:
+                h,s,v = self.last_pick_hsv
+                lines.append(f"Last pick HSV = {h},{s},{v}")
+
         y = 8
         for line in lines:
             (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -554,63 +579,66 @@ class ColorToolApp:
             except Exception:
                 pass
 
-    # ---------- Save (JPEG) + AUTO AFTER data ----------
     def on_save(self, _evt=None):
         self.save_as_dialog()
 
+    # ---------- Save (UPDATED to export RGB BEFORE/AFTER CSVs) ----------
     def save_as_dialog(self):
         if not hasattr(self, "img_full"):
             return
-        # 1) Ask where to save the EDITED JPEG (user may cancel — AFTER data will still be saved)
-        in_dir  = self.src_dir
-        in_base = self.src_name
+        in_dir  = os.path.dirname(self.image_path.get())
+        in_base = os.path.splitext(os.path.basename(self.image_path.get()))[0]
         suffix  = "cvd" if self.mode.get()=="cvd" else "highlight"
         default_name = f"{in_base}_{suffix}_edited.jpg"
+
         path = filedialog.asksaveasfilename(
-            title="Save processed image (optional — AFTER data will be saved regardless)",
+            title="Save processed image",
             initialdir=in_dir,
             initialfile=default_name,
             defaultextension=".jpg",
             filetypes=[("JPEG image","*.jpg"), ("All files","*.*")]
         )
+        if not path:
+            return
 
-        # 2) Compute AFTER frame
-        after_full = self.current_processed_full()
-        # (Round-trip binary -> pixels to honor your original spec)
-        buf_after  = pixels_to_binary(after_full)
-        after_full = binary_to_pixels(buf_after, after_full.shape, dtype=np.uint8)
+        # Process full-res and do the binary round-trip (unchanged behavior)
+        processed = self.current_processed_full()
+        buf  = pixels_to_binary(processed)
+        processed2 = binary_to_pixels(buf, processed.shape, dtype=np.uint8)
 
-        # 3) AUTO-SAVE AFTER data (bits + pixels) beside the SOURCE image
+        # Write image
+        ok = cv2.imwrite(path, processed2, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            messagebox.showerror("Error", f"Could not write image:\n{path}")
+            return
+
+        # ALSO write the 4 RGB CSV files for BEFORE/AFTER (decimal + binary-string)
+        base_no_ext, _ = os.path.splitext(path)
+        base_dir = os.path.dirname(base_no_ext)
+        os.makedirs(base_dir, exist_ok=True)
         try:
-            self.save_count += 1
-            tag = f"{suffix}_after#{self.save_count}"
-            after_bits   = os.path.join(self.src_dir, f"{self.src_name}_{tag}_bits.txt")
-            after_pixels = os.path.join(self.src_dir, f"{self.src_name}_{tag}_pixels.csv")
-            write_bits_per_row_txt(after_full, after_bits)
-            write_pixels_csv(after_full, after_pixels)
+            export_rgb_scale_pair(base_no_ext, self.img_full, processed2)
         except Exception as e:
-            messagebox.showwarning("After data not fully saved", f"Error writing AFTER data:\n{e}")
+            messagebox.showwarning("Saved (with a note)",
+                                   f"Image saved.\nBut RGB CSV export had an issue:\n{e}")
+            return
 
-        # 4) If user chose a JPEG path, save the edited image too
-        if path:
-            ok = cv2.imwrite(path, after_full, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            if ok:
-                messagebox.showinfo("Saved",
-                    f"Edited image:\n{path}\n\n"
-                    f"AFTER data written beside source image:\n{after_bits}\n{after_pixels}")
-            else:
-                messagebox.showerror("Error", f"Could not write image:\n{path}")
-        else:
-            messagebox.showinfo("AFTER data saved",
-                f"AFTER data written beside source image:\n{after_bits}\n{after_pixels}\n\n"
-                "No JPEG saved (you canceled the dialog).")
+        msg = (
+            "Saved image and RGB CSVs:\n\n"
+            f"{path}\n"
+            f"{base_no_ext}_before_pixels.csv\n"
+            f"{base_no_ext}_after_pixels.csv\n"
+            f"{base_no_ext}_before_binary.csv\n"
+            f"{base_no_ext}_after_binary.csv\n"
+        )
+        messagebox.showinfo("Saved", msg)
 
-    # ---------- Optional: Save mask (highlight only) ----------
     def on_save_mask(self, _evt=None):
         if self.mode.get() != "highlight":
             return
-        in_dir  = self.src_dir
-        default_name = f"{self.src_name}_highlight_mask.png"
+        in_dir  = os.path.dirname(self.image_path.get())
+        in_base = os.path.splitext(os.path.basename(self.image_path.get()))[0]
+        default_name = f"{in_base}_highlight_mask.png"
         path = filedialog.asksaveasfilename(
             title="Save selection mask (PNG)",
             initialdir=in_dir,
