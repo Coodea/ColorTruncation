@@ -1,13 +1,13 @@
 # color_tool_gui_cvd_v7.py
 # Resizable, fit-to-window preview + separate control panels.
 # Modes:
-#   • Color Vision: pick type (simulate or assist/daltonize), severity/strength.
+#   • Color Vision: choose type (simulate or assist/daltonize), severity/strength.
 #   • Highlight: HSV isolate/overlay with click-to-pick.
 #
 # Quit never saves. Press 'S' to Save As… (choose name & folder).
 # Full-res processing; preview is scaled to your window.
 #
-# SAVE CHANGE: also writes BEFORE/AFTER RGB CSVs:
+# On Save: also writes BEFORE/AFTER RGB CSVs:
 #   <base>_before_pixels.csv  (decimal R,G,B)
 #   <base>_after_pixels.csv   (decimal R,G,B)
 #   <base>_before_binary.csv  (binary-string R,G,B)
@@ -21,9 +21,9 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from typing import Tuple
 
-VERSION_TAG = "v7"
+VERSION_TAG = "v7-linear"
 
-# ---------- Core helpers: image<->pixels<->binary (used for round-trip) ----------
+# ---------- Core helpers: image<->pixels<->binary ----------
 
 def image_to_pixels(img_bgr: np.ndarray) -> np.ndarray:
     if img_bgr is None or img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
@@ -45,7 +45,6 @@ def binary_to_pixels(buf: bytes, shape: Tuple[int,int,int], dtype=np.uint8) -> n
 
 def write_pixels_csv(csv_path: str, rgb: np.ndarray) -> None:
     """Decimal CSV, rows: 'R,G,B'."""
-    h, w = rgb.shape[:2]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("R,G,B\n")
         flat = rgb.reshape(-1, 3)
@@ -54,7 +53,6 @@ def write_pixels_csv(csv_path: str, rgb: np.ndarray) -> None:
 
 def write_binary_csv_bits(csv_path: str, rgb: np.ndarray) -> None:
     """Binary CSV, rows: 'R,G,B' but each value is an 8-bit binary string."""
-    h, w = rgb.shape[:2]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         f.write("R,G,B\n")
         flat = rgb.reshape(-1, 3)
@@ -72,11 +70,8 @@ def export_rgb_scale_pair(out_base: str, before_bgr: np.ndarray, after_bgr: np.n
     before_rgb = cv2.cvtColor(before_bgr, cv2.COLOR_BGR2RGB)
     after_rgb  = cv2.cvtColor(after_bgr,  cv2.COLOR_BGR2RGB)
 
-    # Decimal CSVs
     write_pixels_csv(f"{out_base}_before_pixels.csv", before_rgb)
     write_pixels_csv(f"{out_base}_after_pixels.csv",  after_rgb)
-
-    # Binary-string CSVs
     write_binary_csv_bits(f"{out_base}_before_binary.csv", before_rgb)
     write_binary_csv_bits(f"{out_base}_after_binary.csv",  after_rgb)
 
@@ -122,13 +117,42 @@ def overlay_style(bgr: np.ndarray, mask01: np.ndarray, style:int, bg_dim:float,
     out = base*(1.0 - alpha*mask01[...,None]) + overlay_col[None,None,:]*(alpha*mask01[...,None])
     return np.clip(out, 0, 255).astype(np.uint8)
 
-# ---------- Color-Vision (LMS-based) ----------
+# ---------- Color-Vision (LMS-based, linear RGB pipeline) ----------
 
+# sRGB <-> Linear helpers (for accurate LMS math)
+def srgb_to_linear(rgb01: np.ndarray) -> np.ndarray:
+    """sRGB (0..1) to linear RGB (0..1)."""
+    a = rgb01.astype(np.float32)
+    low  = a <= 0.04045
+    out = np.empty_like(a, dtype=np.float32)
+    out[low]  = a[low] / 12.92
+    out[~low] = ((a[~low] + 0.055) / 1.055) ** 2.4
+    return out
+
+def linear_to_srgb(lin: np.ndarray) -> np.ndarray:
+    """linear RGB (0..1) to sRGB (0..1)."""
+    a = np.clip(lin, 0.0, 1.0).astype(np.float32)
+    low  = a <= 0.0031308
+    out = np.empty_like(a, dtype=np.float32)
+    out[low]  = 12.92 * a[low]
+    out[~low] = 1.055 * (a[~low] ** (1/2.4)) - 0.055
+    return out
+
+def bgr_to_rgb01(bgr: np.ndarray) -> np.ndarray:
+    """Return sRGB 0..1 (gamma-encoded)."""
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+def rgb01_to_bgr(rgb01: np.ndarray) -> np.ndarray:
+    rgb8 = np.clip(np.round(rgb01 * 255.0), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
+
+# Hunt–Pointer–Estevez LMS matrices
 RGB_to_LMS = np.array([[0.31399022, 0.63951294, 0.04649755],
                        [0.15537241, 0.75789446, 0.08670142],
                        [0.01775239, 0.10944209, 0.87256922]], dtype=np.float32)
 LMS_to_RGB = np.linalg.inv(RGB_to_LMS).astype(np.float32)
 
+# Brettel-based dichromat “projection” matrices (same as before)
 SIM_PROTAN = np.array([[0.0, 1.05118294, -0.05116099],
                        [0.0, 1.0,         0.0       ],
                        [0.0, 0.0,         1.0       ]], dtype=np.float32)
@@ -139,17 +163,18 @@ SIM_TRITAN = np.array([[1.0, 0.0,         0.0      ],
                        [0.0, 1.0,         0.0      ],
                        [-0.86744736, 1.86727089, 0.0]], dtype=np.float32)
 
-def bgr_to_rgb01(bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+def simulate_cvd_rgb(rgb01_srgb: np.ndarray, kind: str) -> np.ndarray:
+    """Simulate protan/deutan/tritan in linear-light; return sRGB 0..1."""
+    # sRGB -> linear
+    rgb_lin = srgb_to_linear(rgb01_srgb)
 
-def rgb01_to_bgr(rgb01: np.ndarray) -> np.ndarray:
-    rgb8 = np.clip(np.round(rgb01 * 255.0), 0, 255).astype(np.uint8)
-    return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
+    h, w, _ = rgb_lin.shape
+    flat = rgb_lin.reshape(-1, 3).astype(np.float32)
 
-def simulate_cvd_rgb(rgb01: np.ndarray, kind: str) -> np.ndarray:
-    h, w, _ = rgb01.shape
-    flat = rgb01.reshape(-1, 3).astype(np.float32)
+    # linear RGB -> LMS
     lms = flat @ RGB_to_LMS.T
+
+    # apply deficiency
     if kind == "protan":
         lms2 = lms @ SIM_PROTAN.T
     elif kind == "deutan":
@@ -158,63 +183,82 @@ def simulate_cvd_rgb(rgb01: np.ndarray, kind: str) -> np.ndarray:
         lms2 = lms @ SIM_TRITAN.T
     else:
         raise ValueError("Unknown CVD kind")
-    rgb2 = lms2 @ LMS_to_RGB.T
-    return np.clip(rgb2.reshape(h, w, 3), 0.0, 1.0)
 
-def simulate_achromatopsia(rgb01: np.ndarray) -> np.ndarray:
-    Y = (0.2126*rgb01[...,0] + 0.7152*rgb01[...,1] + 0.0722*rgb01[...,2])[..., None]
-    return np.repeat(Y, 3, axis=-1)
+    # LMS -> linear RGB
+    rgb_lin_sim = lms2 @ LMS_to_RGB.T
+    rgb_lin_sim = np.clip(rgb_lin_sim, 0.0, 1.0).reshape(h, w, 3)
 
-def daltonize_rgb(rgb01: np.ndarray, kind: str, strength: float=0.8) -> np.ndarray:
-    if kind == "achroma":
-        sim = simulate_achromatopsia(rgb01)
-        err = rgb01 - sim
-        return np.clip(sim + strength * err, 0.0, 1.0)
-    sim = simulate_cvd_rgb(rgb01, kind)
-    err = rgb01 - sim
+    # linear -> sRGB
+    return linear_to_srgb(rgb_lin_sim)
+
+def simulate_achromatopsia(rgb01_srgb: np.ndarray) -> np.ndarray:
+    """Complete color vision loss simulated via linear luminance."""
+    lin = srgb_to_linear(rgb01_srgb)
+    Y = (0.2126*lin[...,0] + 0.7152*lin[...,1] + 0.0722*lin[...,2])[..., None]
+    lin_grey = np.repeat(Y, 3, axis=-1)
+    return linear_to_srgb(lin_grey)
+
+def daltonize_rgb(rgb01_srgb: np.ndarray, kind: str, strength: float=0.8) -> np.ndarray:
+    """
+    Simple error-reinjection daltonization in LINEAR space, then convert back to sRGB.
+    """
+    rgb_lin = srgb_to_linear(rgb01_srgb)
+    sim_srgb = simulate_achromatopsia(rgb01_srgb) if kind == "achroma" else simulate_cvd_rgb(rgb01_srgb, kind)
+    sim_lin  = srgb_to_linear(sim_srgb)
+
+    err = rgb_lin - sim_lin
     if kind == "protan":
         corr = np.stack([0.0*err[...,0], 0.7*err[...,0], 0.7*err[...,0]], axis=-1)
     elif kind == "deutan":
         corr = np.stack([0.7*err[...,1], 0.0*err[...,1], 0.7*err[...,1]], axis=-1)
-    else:  # tritan
+    else:  # tritan or achroma proxy
         corr = np.stack([0.7*err[...,2], 0.7*err[...,2], 0.0*err[...,2]], axis=-1)
-    return np.clip(rgb01 + strength * corr, 0.0, 1.0)
+
+    out_lin = np.clip(rgb_lin + strength * corr, 0.0, 1.0)
+    return linear_to_srgb(out_lin)
 
 def apply_cvd_pipeline(bgr: np.ndarray, cvd_type_ui: str, view_mode: str,
                        severity01: float, assist_strength01: float,
                        rg_subtype: str = "deutan", tri_variant: str = "deutan") -> np.ndarray:
-    rgb = bgr_to_rgb01(bgr)
+    """Top-level: map UI type → base model; simulate or assist; blend by severity."""
+    rgb_s = bgr_to_rgb01(bgr)
     label = (cvd_type_ui or "").lower().replace("–", "-")
 
     if "deuteranopia" in label or "deuteranomaly" in label:
         base = "deutan"
     elif "protanopia" in label or "protanomaly" in label:
         base = "protan"
-    elif "tritanopia" in label or "tritanomaly" in label or "blue-yellow" in label:
+    elif "tritanopia" in label or "tritanomaly" in label:
         base = "tritan"
-    elif "achromatopsia" in label or "complete colorblindness" in label:
+    elif "achromatopsia" in label:
         base = "achroma"
-    elif "red-green" in label:
-        base = "deutan" if rg_subtype == "deutan" else "protan"
     elif "anomalous trichromacy" in label:
         base = tri_variant
     else:
         base = "deutan"
 
-    sim = simulate_achromatopsia(rgb) if base == "achroma" else simulate_cvd_rgb(rgb, base)
-    rgb_sim = (1.0 - severity01) * rgb + severity01 * sim
     if view_mode == "simulate":
-        return rgb01_to_bgr(rgb_sim)
-    out = daltonize_rgb(rgb, base if base != "achroma" else "achroma", assist_strength01)
-    out = (1.0 - severity01) * rgb + severity01 * out
-    return rgb01_to_bgr(out)
+        sim_s = simulate_achromatopsia(rgb_s) if base == "achroma" else simulate_cvd_rgb(rgb_s, base)
+        out_s = (1.0 - severity01) * rgb_s + severity01 * sim_s
+    else:
+        assist_s = daltonize_rgb(rgb_s, base if base != "achroma" else "achroma",
+                                 strength=assist_strength01)
+        out_s = (1.0 - severity01) * rgb_s + severity01 * assist_s
+
+    return rgb01_to_bgr(np.clip(out_s, 0.0, 1.0))
 
 # ---------- App ----------
 
+# Removed from list: "Blue-Yellow colorblindness", "Complete colorblindness", "Red–green color blindness"
 CVD_TYPES = [
-    "Deuteranopia", "Protanopia", "Tritanopia", "Blue-Yellow colorblindness",
-    "Complete colorblindness", "Deuteranomaly", "Protanomaly",
-    "Red–green color blindness", "Achromatopsia", "Tritanomaly", "Anomalous Trichromacy",
+    "Deuteranopia",
+    "Protanopia",
+    "Tritanopia",
+    "Deuteranomaly",
+    "Protanomaly",
+    "Achromatopsia",
+    "Tritanomaly",
+    "Anomalous Trichromacy",
 ]
 
 class ColorToolApp:
@@ -224,12 +268,12 @@ class ColorToolApp:
         self.root.geometry("560x260")
         self.root.resizable(False, False)
 
-        # Predefine CVD vars so preview can run anytime
+        # CVD vars
         self.var_cvd_type    = tk.StringVar(value=CVD_TYPES[0])
         self.var_view        = tk.StringVar(value="simulate")  # "simulate" or "assist"
         self.var_sev         = tk.IntVar(value=100)
         self.var_strength    = tk.IntVar(value=80)
-        self.var_rg_sub      = tk.StringVar(value="deutan")
+        self.var_rg_sub      = tk.StringVar(value="deutan")     # kept but hidden
         self.var_tri_variant = tk.StringVar(value="deutan")
 
         self.mode = tk.StringVar(value="cvd")  # "cvd" or "highlight"
@@ -278,7 +322,7 @@ class ColorToolApp:
         self.show_mask = False
         self.last_pick_hsv = None
 
-        # Image viewer (Tk Canvas — resizable, fit-to-window)
+        # Image viewer
         self.viewer = tk.Toplevel(self.root)
         self.viewer.title(f"Image — Fit to Window [{VERSION_TAG}]  (S=Save  M=Mask  O=Original  Space=Mask  Q/Esc=Quit)")
         self.viewer.geometry("1000x640")
@@ -319,6 +363,7 @@ class ColorToolApp:
         self.sub_frame = tk.Frame(self.ctrl)
         self.sub_frame.pack(fill="x", padx=10, pady=6)
 
+        # kept (unused visually) RG row
         self.rg_row = tk.Frame(self.sub_frame)
         tk.Label(self.rg_row, text="Red–Green subtype:").pack(side="left")
         ttk.Radiobutton(self.rg_row, text="Deutan-like", variable=self.var_rg_sub, value="deutan",
@@ -369,12 +414,11 @@ class ColorToolApp:
         self._update_subrows()
 
     def _update_subrows(self):
+        # Only show Anomalous Trichromacy variant row (red–green menu removed from list)
         t = self.var_cvd_type.get()
         for r in (getattr(self, "rg_row", None), getattr(self, "tri_row", None)):
             if r is not None:
                 r.pack_forget()
-        if t == "Red–green color blindness":
-            self.rg_row.pack(anchor="w", pady=4)
         if t == "Anomalous Trichromacy":
             self.tri_row.pack(anchor="w", pady=4)
 
@@ -509,8 +553,6 @@ class ColorToolApp:
             mode_txt = "Simulate" if self.var_view.get() == "simulate" else "Assist"
             sev = self.var_sev.get()
             lines.append(f"CVD: {t}  Mode: {mode_txt}  Severity: {sev}%")
-            if t == "Red–green color blindness":
-                lines.append(f"Subtype: {'Deutan-like' if self.var_rg_sub.get()=='deutan' else 'Protan-like'}")
             if t == "Anomalous Trichromacy":
                 var = self.var_tri_variant.get()
                 lines.append(f"Variant: { {'deutan':'Deuteranomaly','protan':'Protanomaly','tritan':'Tritanomaly'}[var] }")
@@ -522,7 +564,7 @@ class ColorToolApp:
             smin,smax,vmin,vmax = self.var_smin.get(), self.var_smax.get(), self.var_vmin.get(), self.var_vmax.get()
             style = ["KeepOnly","DimBG","Overlay"][self.var_style.get()]
             lines.append(f"Highlight: H {hc}±{hr}  S {smin}-{smax}  V {vmin}-{vmax}  Style {style}  Inv {self.var_invert.get()}")
-            lines.append("Click to pick color.  S=Save  M=Mask  O=Original  Space=Mask  Q/Esc=Quit")
+            lines.append("Click to pick color.  S=Save  M=Save Mask  O=Original  Space=Mask  Q/Esc=Quit")
             if self.last_pick_hsv is not None:
                 h,s,v = self.last_pick_hsv
                 lines.append(f"Last pick HSV = {h},{s},{v}")
@@ -582,7 +624,7 @@ class ColorToolApp:
     def on_save(self, _evt=None):
         self.save_as_dialog()
 
-    # ---------- Save (UPDATED to export RGB BEFORE/AFTER CSVs) ----------
+    # ---------- Save (writes image + RGB CSVs) ----------
     def save_as_dialog(self):
         if not hasattr(self, "img_full"):
             return
@@ -601,18 +643,16 @@ class ColorToolApp:
         if not path:
             return
 
-        # Process full-res and do the binary round-trip (unchanged behavior)
         processed = self.current_processed_full()
+        # keep your round-trip
         buf  = pixels_to_binary(processed)
         processed2 = binary_to_pixels(buf, processed.shape, dtype=np.uint8)
 
-        # Write image
         ok = cv2.imwrite(path, processed2, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if not ok:
             messagebox.showerror("Error", f"Could not write image:\n{path}")
             return
 
-        # ALSO write the 4 RGB CSV files for BEFORE/AFTER (decimal + binary-string)
         base_no_ext, _ = os.path.splitext(path)
         base_dir = os.path.dirname(base_no_ext)
         os.makedirs(base_dir, exist_ok=True)
