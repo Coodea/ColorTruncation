@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# Unique 8-bit counter + "what it became" (R/G/B)
+# Rows come ONLY from unique strings that appear in BEFORE.
+# Default ordering = First occurrence in BEFORE (no lexicographic walk).
+
+import csv
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from collections import Counter, OrderedDict
+from typing import List, Tuple
+from PIL import Image
+
+# -------- CSV helpers --------
+
+def _clean_cell(x: str) -> str:
+    x = (x or "").strip()
+    if len(x) >= 2 and ((x[0] == x[-1] == '"') or (x[0] == x[-1] == "'")):
+        x = x[1:-1]
+    return x.strip()
+
+def _to_8bit(cell: str) -> str:
+    c = _clean_cell(cell)
+    if c.lower().startswith("0b"):
+        c = c[2:]
+    if len(c) == 8 and set(c) <= {"0","1"}:
+        return c
+    try:
+        v = int(c)
+        if 0 <= v <= 255:
+            return f"{v:08b}"
+    except Exception:
+        pass
+    return ""
+
+def _read_binary_csv_8bit(path: str) -> Tuple[List[Tuple[str,str,str]], int]:
+    rows, skipped = [], 0
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rdr = csv.reader(f)
+        first = True
+        for row in rdr:
+            if not row or len(row) < 3:
+                skipped += 1; continue
+            if first:
+                head = ",".join(_clean_cell(x).lower() for x in row[:3])
+                if head in ("r,g,b","r, g, b"):
+                    first = False; continue
+                first = False
+            r8 = _to_8bit(row[0]); g8 = _to_8bit(row[1]); b8 = _to_8bit(row[2])
+            if r8 and g8 and b8:
+                rows.append((r8,g8,b8))
+            else:
+                skipped += 1
+    return rows, skipped
+
+# -------- Core --------
+
+def channel_lists_and_first_seen(before_rows: List[Tuple[str,str,str]],
+                                 after_rows:  List[Tuple[str,str,str]],
+                                 ch: str):
+    if ch == "R":
+        b_list = [r for (r,_,_) in before_rows]
+        a_list = [r for (r,_,_) in after_rows]
+    elif ch == "G":
+        b_list = [g for (_,g,_) in before_rows]
+        a_list = [g for (_,g,_) in after_rows]
+    else:
+        b_list = [b for (_,_,b) in before_rows]
+        a_list = [b for (_,_,b) in after_rows]
+    # first-seen order from BEFORE
+    first_seen = OrderedDict()
+    for s in b_list:
+        if s not in first_seen:
+            first_seen[s] = None
+    return b_list, a_list, list(first_seen.keys())
+
+def most_common_mapping(pair_counts: Counter, b: str) -> Tuple[str,int,bool]:
+    opts = [(a,c) for (bb,a),c in pair_counts.items() if bb == b]
+    if not opts:
+        return "",0,False
+    maxc = max(c for _,c in opts)
+    winners = sorted([a for a,c in opts if c == maxc])
+    return winners[0], maxc, (len(winners) > 1)
+
+def build_table(before_rows, after_rows, ch: str):
+    """
+    *** Fixed version ***
+    Counts are limited to the same first-n rows used for mapping
+    (n = min(len(before), len(after))) so after-counts cannot exceed pixels.
+    """
+    b_list, a_list, first_seen_order = channel_lists_and_first_seen(before_rows, after_rows, ch)
+
+    # Use the same window on BOTH sides
+    n = min(len(b_list), len(a_list))
+    b_used = b_list[:n]
+    a_used = a_list[:n]
+
+    # global counts on the SAME window
+    c_before = Counter(b_used)
+    c_after  = Counter(a_used)
+
+    # rowwise mapping counts on the same window
+    pair_counts = Counter(zip(b_used, a_used))
+
+    table = []
+    for b in first_seen_order:  # ONLY strings that actually occur in BEFORE, first-seen order
+        a_star, mapped, tied = most_common_mapping(pair_counts, b)
+        cb = c_before.get(b, 0)
+        ca = c_after.get(a_star, 0) if a_star else 0
+        table.append([b, a_star, tied, cb, ca, ca - cb, mapped])
+
+    totals = {
+        "total_before_lines": len(b_used),   # == n
+        "total_after_lines":  len(a_used),   # == n
+        "sum_before_counts":  sum(c_before.values()),  # == n
+        "sum_after_counts":   sum(c_after.values()),   # == n
+        "unique_before":      len(first_seen_order),
+        "pairs_used":         n,
+    }
+    return table, totals
+
+# -------- GUI --------
+
+class App:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Unique 8-bit Counter + Edited Mapping (First-seen from BEFORE)")
+        self.root.geometry("1120x740")
+
+        self.image_path  = tk.StringVar()
+        self.before_path = tk.StringVar()
+        self.after_path  = tk.StringVar()
+        self.channel     = tk.StringVar(value="R")  # R/G/B
+
+        # Sorting: add "First seen (before)" default
+        self.sort_by     = tk.StringVar(value="FirstSeen")  # FirstSeen | Binary | Before | After | Delta | Mapped
+        self.only_changes = tk.BooleanVar(value=False)
+        self.hide_zero_ed = tk.BooleanVar(value=True)
+
+        # pickers
+        top = tk.Frame(self.root); top.pack(fill="x", padx=10, pady=(10,6))
+        tk.Label(top, text="Image:").grid(row=0, column=0, sticky="w")
+        tk.Entry(top, textvariable=self.image_path, width=90).grid(row=0, column=1, sticky="we", padx=6)
+        tk.Button(top, text="Browse…", command=self.pick_image).grid(row=0, column=2)
+
+        tk.Label(top, text="Before (binary CSV):").grid(row=1, column=0, sticky="w", pady=(6,0))
+        tk.Entry(top, textvariable=self.before_path, width=90).grid(row=1, column=1, sticky="we", padx=6, pady=(6,0))
+        tk.Button(top, text="Browse…", command=self.pick_before).grid(row=1, column=2, pady=(6,0))
+
+        tk.Label(top, text="After (binary CSV):").grid(row=2, column=0, sticky="w", pady=(6,0))
+        tk.Entry(top, textvariable=self.after_path, width=90).grid(row=2, column=1, sticky="we", padx=6, pady=(6,0))
+        tk.Button(top, text="Browse…", command=self.pick_after).grid(row=2, column=2, pady=(6,0))
+
+        # options
+        opts = tk.Frame(self.root); opts.pack(fill="x", padx=10, pady=6)
+        tk.Label(opts, text="Channel:").pack(side="left")
+        for ch in ("R","G","B"):
+            tk.Radiobutton(opts, text=ch, variable=self.channel, value=ch,
+                           command=lambda: self.compute()).pack(side="left", padx=(6,12))
+
+        tk.Label(opts, text="Sort by:").pack(side="left", padx=(12,0))
+        tk.OptionMenu(opts, self.sort_by, "FirstSeen", "Binary", "Before", "After", "Delta", "Mapped").pack(side="left", padx=(0,12))
+
+        tk.Checkbutton(opts, text="Only rows with change", variable=self.only_changes,
+                       command=lambda: self.compute(redraw_only=True)).pack(side="left", padx=(0,12))
+        tk.Checkbutton(opts, text="Hide edited = 00000000", variable=self.hide_zero_ed,
+                       command=lambda: self.compute(redraw_only=True)).pack(side="left")
+
+        tk.Button(opts, text="Compute", command=self.compute).pack(side="left", padx=10)
+        tk.Button(opts, text="Export CSV…", command=self.export_csv).pack(side="left")
+        tk.Button(opts, text="Quit", command=self.root.destroy).pack(side="right")
+
+        self.info = tk.StringVar(value="Pick image + CSVs, choose channel, then Compute.")
+        tk.Label(self.root, textvariable=self.info, anchor="w").pack(fill="x", padx=10)
+
+        self.text = tk.Text(self.root, height=28, font=("Consolas", 10))
+        self.text.pack(fill="both", expand=True, padx=10, pady=(0,10))
+
+        self._last_raw_table = None
+        self._last_totals = None
+        self._img_pixels = 0
+        self._view_rows = None
+
+        self.root.mainloop()
+
+    # pickers
+    def pick_image(self):
+        p = filedialog.askopenfilename(title="Choose image",
+            filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"), ("All files","*.*")])
+        if p: self.image_path.set(p)
+    def pick_before(self):
+        p = filedialog.askopenfilename(title="Choose BEFORE binary CSV",
+            filetypes=[("CSV","*.csv"), ("All files","*.*")])
+        if p: self.before_path.set(p)
+    def pick_after(self):
+        p = filedialog.askopenfilename(title="Choose AFTER binary CSV",
+            filetypes=[("CSV","*.csv"), ("All files","*.*")])
+        if p: self.after_path.set(p)
+
+    # compute
+    def compute(self, redraw_only: bool=False):
+        try:
+            if not redraw_only:
+                imgp = self.image_path.get().strip()
+                bp   = self.before_path.get().strip()
+                ap   = self.after_path.get().strip()
+                if not (imgp and bp and ap):
+                    messagebox.showwarning("Missing", "Select image, BEFORE CSV, and AFTER CSV.")
+                    return
+
+                with Image.open(imgp) as im:
+                    w,h = im.size
+                self._img_pixels = w*h
+
+                before_rows, skipped_b = _read_binary_csv_8bit(bp)
+                after_rows,  skipped_a = _read_binary_csv_8bit(ap)
+
+                raw_table, totals = build_table(before_rows, after_rows, self.channel.get())
+                self._last_raw_table = raw_table
+                self._last_totals = {**totals, "skipped_before": skipped_b, "skipped_after": skipped_a}
+
+            if self._last_raw_table is None:
+                return
+
+            # view filters
+            table = []
+            for b, a, tied, cb, ca, delta, mapped in self._last_raw_table:
+                if self.only_changes.get() and a and b == a:
+                    continue
+                table.append([b, a, tied, cb, ca, delta, mapped])
+
+            # sorting
+            sorter = self.sort_by.get()
+            if sorter == "FirstSeen":
+                pass  # keep produced order (first-seen from BEFORE)
+            elif sorter == "Binary":
+                table.sort(key=lambda r: r[0])
+            elif sorter == "Before":
+                table.sort(key=lambda r: (-r[3], r[0]))
+            elif sorter == "After":
+                table.sort(key=lambda r: (-r[4], r[0]))
+            elif sorter == "Delta":
+                table.sort(key=lambda r: (-r[5], r[0]))
+            else:  # Mapped
+                table.sort(key=lambda r: (-r[6], r[0]))
+
+            # render
+            self.text.delete("1.0","end")
+            header = ["Binary (8b)", "Edited binary (most common)", "Count before",
+                      "Count after (edited)", "Δ(after-before)", "#Mapped"]
+            widths = [12, 30, 14, 20, 18, 10]
+            def fmt_row(cols): return " ".join(str(v).ljust(w) for v,w in zip(cols,widths))
+
+            self.text.insert("end", fmt_row(header) + "\n")
+            self.text.insert("end", "-" * (sum(widths) + 3) + "\n")
+            for b,a,tied,cb,ca,delta,mapped in table:
+                if not a or (self.hide_zero_ed.get() and a == "00000000"):
+                    label = "—"
+                else:
+                    label = a + ("*" if tied else "")
+                self.text.insert("end", fmt_row([b, label, cb, ca, delta, mapped]) + "\n")
+
+            t = self._last_totals
+            self.text.insert("end","\n")
+            self.text.insert("end", f"Unique BEFORE strings: {t['unique_before']} | Pairs used: {t['pairs_used']}\n")
+            self.text.insert("end", f"Total lines (before/after): {t['total_before_lines']} / {t['total_after_lines']}\n")
+            self.text.insert("end", f"Sum counts (before/after): {t['sum_before_counts']} / {t['sum_after_counts']}\n")
+            self.text.insert("end", f"Total pixels (image): {self._img_pixels}\n")
+            if t['total_before_lines'] != self._img_pixels or t['total_after_lines'] != self._img_pixels:
+                self.text.insert("end", "\nWARNING: CSV lines != image pixels.\n")
+            if t['skipped_before'] or t['skipped_after']:
+                self.text.insert("end", f"Skipped invalid rows — before: {t['skipped_before']}, after: {t['skipped_after']}\n")
+            self.text.insert("end", "Ordering: First occurrence in BEFORE (default). Use Sort menu to change.\n")
+
+            self._view_rows = table
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # export
+    def export_csv(self):
+        if not self._view_rows:
+            messagebox.showinfo("Nothing to export", "Compute first."); return
+        p = filedialog.asksaveasfilename(title="Save table as CSV",
+                                         defaultextension=".csv",
+                                         filetypes=[("CSV","*.csv")])
+        if not p: return
+        try:
+            with open(p, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Binary (8b)", "Edited binary (most common)", "Count before",
+                            "Count after (edited)", "Delta (after-before)", "Mapped pairs"])
+                for b,a,tied,cb,ca,delta,mapped in self._view_rows:
+                    label = "" if (not a or (self.hide_zero_ed.get() and a == "00000000")) else a + ("*" if tied else "")
+                    w.writerow([b, label, cb, ca, delta, mapped])
+
+                t = self._last_totals
+                w.writerow([])
+                w.writerow(["Channel", self.channel.get()])
+                w.writerow(["Sorted by", self.sort_by.get()])
+                w.writerow(["Only rows with change", self.only_changes.get()])
+                w.writerow(["Hide edited = 00000000", self.hide_zero_ed.get()])
+                w.writerow(["Unique BEFORE strings", t["unique_before"]])
+                w.writerow(["Pairs used for mapping", t["pairs_used"]])
+                w.writerow(["Total number lines (before)", t["total_before_lines"]])
+                w.writerow(["Total number lines (after)",  t["total_after_lines"]])
+                w.writerow(["Sum of counts (before)",      t["sum_before_counts"]])
+                w.writerow(["Sum of counts (after)",       t["sum_after_counts"]])
+                w.writerow(["Total pixels (image)",        self._img_pixels])
+                w.writerow(["Skipped invalid rows (before)", t["skipped_before"]])
+                w.writerow(["Skipped invalid rows (after)",  t["skipped_after"]])
+            messagebox.showinfo("Saved", f"Saved to:\n{p}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+if __name__ == "__main__":
+    App()
