@@ -2,6 +2,10 @@
 # Unique 8-bit counter + "what it became" (R/G/B)
 # Rows come ONLY from unique strings that appear in BEFORE.
 # Default ordering = First occurrence in BEFORE (no lexicographic walk).
+# Added:
+#  - Percent loss vs SAME binary in AFTER (per row)
+#  - "Top combinations" section for highest before->after pairs
+#  - Percent total change over all rows
 
 import csv
 import tkinter as tk
@@ -66,7 +70,6 @@ def channel_lists_and_first_seen(before_rows: List[Tuple[str,str,str]],
     else:
         b_list = [b for (_,_,b) in before_rows]
         a_list = [b for (_,_,b) in after_rows]
-    # first-seen order from BEFORE
     first_seen = OrderedDict()
     for s in b_list:
         if s not in first_seen:
@@ -83,38 +86,62 @@ def most_common_mapping(pair_counts: Counter, b: str) -> Tuple[str,int,bool]:
 
 def build_table(before_rows, after_rows, ch: str):
     """
-    *** Fixed version ***
     Counts are limited to the same first-n rows used for mapping
-    (n = min(len(before), len(after))) so after-counts cannot exceed pixels.
+    (n = min(len(before), len(after))).
+    We compute:
+      - cb: BEFORE count (per binary) in window
+      - ca_same: AFTER count of the *same* binary
+      - pct_loss: max((cb - ca_same) / cb, 0) * 100
+      - a_star / mapped_star: most common edited target and its pair count
+      - mapped_total: total mapped out of this binary across ANY after (== cb)
+      Also produce:
+      - identity_count, total_changed, pct_total_changed
+      - top_pairs: list of most frequent before->after pairs (excluding identity)
     """
     b_list, a_list, first_seen_order = channel_lists_and_first_seen(before_rows, after_rows, ch)
 
-    # Use the same window on BOTH sides
     n = min(len(b_list), len(a_list))
     b_used = b_list[:n]
     a_used = a_list[:n]
 
-    # global counts on the SAME window
+    # counts within same window
     c_before = Counter(b_used)
     c_after  = Counter(a_used)
-
-    # rowwise mapping counts on the same window
     pair_counts = Counter(zip(b_used, a_used))
 
+    # identity / total change
+    identity_count = sum(pair_counts.get((x, x), 0) for x in c_before.keys())
+    total_changed = n - identity_count
+    pct_total_changed = (100.0 * total_changed / n) if n else 0.0
+
+    # top combinations (exclude identity)
+    top_pairs_all = [ (b,a,c) for (b,a),c in pair_counts.items() if b != a ]
+    top_pairs_all.sort(key=lambda t: (-t[2], t[0], t[1]))
+
+    # build rows
     table = []
-    for b in first_seen_order:  # ONLY strings that actually occur in BEFORE, first-seen order
-        a_star, mapped, tied = most_common_mapping(pair_counts, b)
+    for b in first_seen_order:
         cb = c_before.get(b, 0)
-        ca = c_after.get(a_star, 0) if a_star else 0
-        table.append([b, a_star, tied, cb, ca, ca - cb, mapped])
+        a_star, mapped_star, tied = most_common_mapping(pair_counts, b)
+        ca_same = c_after.get(b, 0)                      # AFTER count of the *same* binary
+        delta_same = ca_same - cb
+        pct_loss = (max(cb - ca_same, 0) / cb * 100.0) if cb else 0.0
+        mapped_total = cb                                 # total mapped from b across ANY after
+
+        # Row fields:
+        # [b, a_star, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total]
+        table.append([b, a_star, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total])
 
     totals = {
-        "total_before_lines": len(b_used),   # == n
-        "total_after_lines":  len(a_used),   # == n
-        "sum_before_counts":  sum(c_before.values()),  # == n
-        "sum_after_counts":   sum(c_after.values()),   # == n
+        "n_rows":             n,
+        "identity_count":     identity_count,
+        "total_changed":      total_changed,
+        "pct_total_changed":  pct_total_changed,
         "unique_before":      len(first_seen_order),
+        "sum_before_counts":  n,
+        "sum_after_counts":   n,
         "pairs_used":         n,
+        "top_pairs":          top_pairs_all,   # list of (b,a,count)
     }
     return table, totals
 
@@ -124,7 +151,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Unique 8-bit Counter + Edited Mapping (First-seen from BEFORE)")
-        self.root.geometry("1120x740")
+        self.root.geometry("1200x780")
 
         self.image_path  = tk.StringVar()
         self.before_path = tk.StringVar()
@@ -132,22 +159,22 @@ class App:
         self.channel     = tk.StringVar(value="R")  # R/G/B
 
         # Sorting: add "First seen (before)" default
-        self.sort_by     = tk.StringVar(value="FirstSeen")  # FirstSeen | Binary | Before | After | Delta | Mapped
+        self.sort_by     = tk.StringVar(value="FirstSeen")  # FirstSeen | Binary | Before | AfterSame | Loss | Mapped | DeltaSame
         self.only_changes = tk.BooleanVar(value=False)
         self.hide_zero_ed = tk.BooleanVar(value=True)
 
         # pickers
         top = tk.Frame(self.root); top.pack(fill="x", padx=10, pady=(10,6))
         tk.Label(top, text="Image:").grid(row=0, column=0, sticky="w")
-        tk.Entry(top, textvariable=self.image_path, width=90).grid(row=0, column=1, sticky="we", padx=6)
+        tk.Entry(top, textvariable=self.image_path, width=95).grid(row=0, column=1, sticky="we", padx=6)
         tk.Button(top, text="Browse…", command=self.pick_image).grid(row=0, column=2)
 
         tk.Label(top, text="Before (binary CSV):").grid(row=1, column=0, sticky="w", pady=(6,0))
-        tk.Entry(top, textvariable=self.before_path, width=90).grid(row=1, column=1, sticky="we", padx=6, pady=(6,0))
+        tk.Entry(top, textvariable=self.before_path, width=95).grid(row=1, column=1, sticky="we", padx=6, pady=(6,0))
         tk.Button(top, text="Browse…", command=self.pick_before).grid(row=1, column=2, pady=(6,0))
 
         tk.Label(top, text="After (binary CSV):").grid(row=2, column=0, sticky="w", pady=(6,0))
-        tk.Entry(top, textvariable=self.after_path, width=90).grid(row=2, column=1, sticky="we", padx=6, pady=(6,0))
+        tk.Entry(top, textvariable=self.after_path, width=95).grid(row=2, column=1, sticky="we", padx=6, pady=(6,0))
         tk.Button(top, text="Browse…", command=self.pick_after).grid(row=2, column=2, pady=(6,0))
 
         # options
@@ -158,7 +185,9 @@ class App:
                            command=lambda: self.compute()).pack(side="left", padx=(6,12))
 
         tk.Label(opts, text="Sort by:").pack(side="left", padx=(12,0))
-        tk.OptionMenu(opts, self.sort_by, "FirstSeen", "Binary", "Before", "After", "Delta", "Mapped").pack(side="left", padx=(0,12))
+        tk.OptionMenu(opts, self.sort_by,
+                      "FirstSeen", "Binary", "Before", "AfterSame", "Loss", "DeltaSame", "Mapped"
+                      ).pack(side="left", padx=(0,12))
 
         tk.Checkbutton(opts, text="Only rows with change", variable=self.only_changes,
                        command=lambda: self.compute(redraw_only=True)).pack(side="left", padx=(0,12))
@@ -172,7 +201,7 @@ class App:
         self.info = tk.StringVar(value="Pick image + CSVs, choose channel, then Compute.")
         tk.Label(self.root, textvariable=self.info, anchor="w").pack(fill="x", padx=10)
 
-        self.text = tk.Text(self.root, height=28, font=("Consolas", 10))
+        self.text = tk.Text(self.root, height=30, font=("Consolas", 10))
         self.text.pack(fill="both", expand=True, padx=10, pady=(0,10))
 
         self._last_raw_table = None
@@ -223,55 +252,89 @@ class App:
 
             # view filters
             table = []
-            for b, a, tied, cb, ca, delta, mapped in self._last_raw_table:
-                if self.only_changes.get() and a and b == a:
+            for b, a, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total in self._last_raw_table:
+                if self.only_changes.get() and b == a:
                     continue
-                table.append([b, a, tied, cb, ca, delta, mapped])
+                table.append([b, a, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total])
 
             # sorting
             sorter = self.sort_by.get()
             if sorter == "FirstSeen":
-                pass  # keep produced order (first-seen from BEFORE)
+                pass
             elif sorter == "Binary":
                 table.sort(key=lambda r: r[0])
             elif sorter == "Before":
-                table.sort(key=lambda r: (-r[3], r[0]))
-            elif sorter == "After":
-                table.sort(key=lambda r: (-r[4], r[0]))
-            elif sorter == "Delta":
-                table.sort(key=lambda r: (-r[5], r[0]))
-            else:  # Mapped
-                table.sort(key=lambda r: (-r[6], r[0]))
+                table.sort(key=lambda r: (-r[4], r[0]))        # cb
+            elif sorter == "AfterSame":
+                table.sort(key=lambda r: (-r[5], r[0]))        # ca_same
+            elif sorter == "DeltaSame":
+                table.sort(key=lambda r: (-r[6], r[0]))        # delta_same
+            elif sorter == "Loss":
+                table.sort(key=lambda r: (-r[7], r[0]))        # pct_loss
+            else:  # Mapped (to edited)
+                table.sort(key=lambda r: (-r[3], r[0]))        # mapped_star
 
             # render
             self.text.delete("1.0","end")
-            header = ["Binary (8b)", "Edited binary (most common)", "Count before",
-                      "Count after (edited)", "Δ(after-before)", "#Mapped"]
-            widths = [12, 30, 14, 20, 18, 10]
-            def fmt_row(cols): return " ".join(str(v).ljust(w) for v,w in zip(cols,widths))
+            header = ["Binary (8b)", "Edited (most common)", "#Mapped→edited",
+                      "Count before", "Count after (same)", "Δ same", "% loss", "Mapped total (any)"]
+            widths = [12, 24, 16, 14, 18, 10, 8, 18]
+            def fmt_row(cols): return " ".join((f"{v:.2f}" if isinstance(v,float) else str(v)).ljust(w) for v,w in zip(cols,widths))
 
             self.text.insert("end", fmt_row(header) + "\n")
             self.text.insert("end", "-" * (sum(widths) + 3) + "\n")
-            for b,a,tied,cb,ca,delta,mapped in table:
-                if not a or (self.hide_zero_ed.get() and a == "00000000"):
-                    label = "—"
-                else:
-                    label = a + ("*" if tied else "")
-                self.text.insert("end", fmt_row([b, label, cb, ca, delta, mapped]) + "\n")
+            for b,a,tied,mapped_star,cb,ca_same,delta_same,pct_loss,mapped_total in table:
+                label = "—" if (not a or (self.hide_zero_ed.get() and a == "00000000")) else a + ("*" if tied else "")
+                self.text.insert("end", fmt_row([b, label, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total]) + "\n")
 
             t = self._last_totals
             self.text.insert("end","\n")
-            self.text.insert("end", f"Unique BEFORE strings: {t['unique_before']} | Pairs used: {t['pairs_used']}\n")
-            self.text.insert("end", f"Total lines (before/after): {t['total_before_lines']} / {t['total_after_lines']}\n")
-            self.text.insert("end", f"Sum counts (before/after): {t['sum_before_counts']} / {t['sum_after_counts']}\n")
+            self.text.insert("end", f"Rows analyzed (window): {t['n_rows']} | Unique BEFORE strings: {t['unique_before']}\n")
+            self.text.insert("end", f"No-change (identity) pairs: {t['identity_count']} | Changed rows: {t['total_changed']} "
+                                     f"({t['pct_total_changed']:.2f}% of all rows)\n")
             self.text.insert("end", f"Total pixels (image): {self._img_pixels}\n")
-            if t['total_before_lines'] != self._img_pixels or t['total_after_lines'] != self._img_pixels:
-                self.text.insert("end", "\nWARNING: CSV lines != image pixels.\n")
-            if t['skipped_before'] or t['skipped_after']:
-                self.text.insert("end", f"Skipped invalid rows — before: {t['skipped_before']}, after: {t['skipped_after']}\n")
-            self.text.insert("end", "Ordering: First occurrence in BEFORE (default). Use Sort menu to change.\n")
+            if t['n_rows'] != self._img_pixels:
+                self.text.insert("end", "Note: CSV window rows != image pixels (that can be fine if CSVs differ).\n")
+            if self._last_totals.get('skipped_before') or self._last_totals.get('skipped_after'):
+                self.text.insert("end", f"Skipped invalid rows — before: {self._last_totals['skipped_before']}, "
+                                         f"after: {self._last_totals['skipped_after']}\n")
+
+            # Top combinations
+            top_pairs = t["top_pairs"][:20]  # show top 20
+            if top_pairs:
+                self.text.insert("end", "\nTop combinations (excluding identity):\n")
+                self.text.insert("end", "b (before)  ->  a (after)    count    % of all rows   % of BEFORE(b)\n")
+                for b,a,c in top_pairs:
+                    pct_all = 100.0 * c / t["n_rows"] if t["n_rows"] else 0.0
+                    pct_from_b = 100.0 * c / max(1, sum(1 for _ in range(c)))  # dummy to avoid flake; we replace below
+                # recompute with correct cb:
+                self.text.insert("end", "")  # spacer
+
+                # rebuild with accurate per-b denominators
+                # cb_by_b is simply sum of pair_counts over a for each b, which equals c_before[b]
+                cb_by_b = Counter()
+                for b_, a_, c_ in t["top_pairs"]:
+                    cb_by_b[b_] += 0  # init only
+                # Build cb_by_b from last raw table to be exact
+                cb_by_b.clear()
+                for row in self._last_raw_table:
+                    b_, _, _, _, cb_, _, _, _, _ = row
+                    cb_by_b[b_] = cb_
+
+                self.text.insert("end", "\n")
+                self.text.insert("end", "b (before)  ->  a (after)    count    % of all rows   % of BEFORE(b)\n")
+                for b,a,c in top_pairs:
+                    pct_all = 100.0 * c / t["n_rows"] if t["n_rows"] else 0.0
+                    denom = cb_by_b.get(b, 0)
+                    pct_from_b = 100.0 * c / denom if denom else 0.0
+                    self.text.insert("end", f"{b} -> {a}   {str(c).rjust(8)}   {pct_all:8.2f}%        {pct_from_b:8.2f}%\n")
 
             self._view_rows = table
+
+            self.info.set(
+                f"Channel {self.channel.get()} | Sorted by {self.sort_by.get()} | "
+                f"{len(table)} rows shown."
+            )
 
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -287,27 +350,41 @@ class App:
         try:
             with open(p, "w", encoding="utf-8", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["Binary (8b)", "Edited binary (most common)", "Count before",
-                            "Count after (edited)", "Delta (after-before)", "Mapped pairs"])
-                for b,a,tied,cb,ca,delta,mapped in self._view_rows:
+                w.writerow(["Binary (8b)", "Edited (most common)", "Mapped to edited",
+                            "Count before", "Count after (same)", "Delta same", "Percent loss",
+                            "Mapped total (any)"])
+                for b,a,tied,mapped_star,cb,ca_same,delta_same,pct_loss,mapped_total in self._view_rows:
                     label = "" if (not a or (self.hide_zero_ed.get() and a == "00000000")) else a + ("*" if tied else "")
-                    w.writerow([b, label, cb, ca, delta, mapped])
+                    w.writerow([b, label, mapped_star, cb, ca_same, delta_same, f"{pct_loss:.2f}", mapped_total])
 
+                # footer + top pairs
                 t = self._last_totals
                 w.writerow([])
                 w.writerow(["Channel", self.channel.get()])
                 w.writerow(["Sorted by", self.sort_by.get()])
                 w.writerow(["Only rows with change", self.only_changes.get()])
                 w.writerow(["Hide edited = 00000000", self.hide_zero_ed.get()])
+                w.writerow(["Rows analyzed (window)", t["n_rows"]])
                 w.writerow(["Unique BEFORE strings", t["unique_before"]])
-                w.writerow(["Pairs used for mapping", t["pairs_used"]])
-                w.writerow(["Total number lines (before)", t["total_before_lines"]])
-                w.writerow(["Total number lines (after)",  t["total_after_lines"]])
-                w.writerow(["Sum of counts (before)",      t["sum_before_counts"]])
-                w.writerow(["Sum of counts (after)",       t["sum_after_counts"]])
-                w.writerow(["Total pixels (image)",        self._img_pixels])
-                w.writerow(["Skipped invalid rows (before)", t["skipped_before"]])
-                w.writerow(["Skipped invalid rows (after)",  t["skipped_after"]])
+                w.writerow(["Identity pairs", t["identity_count"]])
+                w.writerow(["Changed rows", t["total_changed"]])
+                w.writerow(["Percent total changed", f"{t['pct_total_changed']:.2f}%"])
+                w.writerow(["Total pixels (image)", self._img_pixels])
+                w.writerow(["Skipped invalid rows (before)", self._last_totals['skipped_before']])
+                w.writerow(["Skipped invalid rows (after)",  self._last_totals['skipped_after']])
+
+                # Top combinations
+                w.writerow([])
+                w.writerow(["Top combinations (excluding identity)"])
+                w.writerow(["Before", "After", "Count", "% of all rows", "% of BEFORE(b)"])
+                # build denominators for % of BEFORE(b)
+                cb_by_b = { row[0]: row[4] for row in self._last_raw_table }  # b -> cb
+                for b,a,c in t["top_pairs"][:20]:
+                    pct_all = 100.0 * c / t["n_rows"] if t["n_rows"] else 0.0
+                    denom = cb_by_b.get(b, 0)
+                    pct_from_b = 100.0 * c / denom if denom else 0.0
+                    w.writerow([b, a, c, f"{pct_all:.2f}%", f"{pct_from_b:.2f}%"])
+
             messagebox.showinfo("Saved", f"Saved to:\n{p}")
         except Exception as e:
             messagebox.showerror("Error", str(e))
