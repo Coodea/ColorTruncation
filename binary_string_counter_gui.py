@@ -80,6 +80,13 @@ def most_common_mapping(pair_counts: Counter, b: str):
     return winners[0], maxc, (len(winners) > 1)
 
 def build_table(before_rows, after_rows, ch: str):
+    """
+    Returns:
+      table      (list of per-unique-before stats rows)
+      totals     (global stats dict)
+      b_used     (list[str] BEFORE channel values, length n_rows)
+      a_used     (list[str] AFTER  channel values, length n_rows)
+    """
     b_list, a_list, first_seen_order = channel_lists_and_first_seen(before_rows, after_rows, ch)
 
     n = min(len(b_list), len(a_list))
@@ -108,15 +115,15 @@ def build_table(before_rows, after_rows, ch: str):
 
         pct_loss = (max(cb - ca_same, 0) / cb * 100.0) if cb else 0.0
 
-        mapped_total = cb  # internal only
+        mapped_total = cb  # kept internal
 
         table.append([
-            b,          # 0 before binary string
-            a_star,     # 1 most common mapped-to
+            b,          # 0 before binary string (8 chars "01010101")
+            a_star,     # 1 most common mapped-to binary
             tied,       # 2 tie flag
-            mapped_star,# 3 #Mapped→edited
+            mapped_star,# 3 #Mapped→edited for that mapping
             cb,         # 4 Count before
-            ca_same,    # 5 Count after (same)
+            ca_same,    # 5 Count after (same binary)
             delta_same, # 6 Δ same
             pct_loss,   # 7 % loss
             mapped_total# 8 internal
@@ -134,7 +141,7 @@ def build_table(before_rows, after_rows, ch: str):
         "top_pairs":         top_pairs_all,
     }
 
-    return table, totals
+    return table, totals, b_used, a_used
 
 class App:
     def __init__(self):
@@ -150,6 +157,10 @@ class App:
         self.sort_by      = tk.StringVar(value="FirstSeen")
         self.only_changes = tk.BooleanVar(value=False)
         self.hide_zero_ed = tk.BooleanVar(value=True)
+
+        # aligned per-row channel lists for this channel (after Compute)
+        self._aligned_before_bits = None  # list[str]
+        self._aligned_after_bits  = None  # list[str]
 
         # --- file pickers row ---
         top = tk.Frame(self.root)
@@ -201,7 +212,7 @@ class App:
         tk.Button(opts, text="Compute", command=self.compute).pack(side="left", padx=10)
         tk.Button(opts, text="Export CSV…", command=self.export_csv).pack(side="left", padx=(0,10))
 
-        # NEW: Trend buttons
+        # Plot buttons
         tk.Button(opts, text="Show Trend (loss vs freq)", command=self.show_trend).pack(side="left", padx=(0,10))
         tk.Button(opts, text="Show Bit Loss", command=self.show_bit_loss).pack(side="left", padx=(0,10))
 
@@ -265,25 +276,28 @@ class App:
                 before_rows, skipped_b = _read_binary_csv_8bit(bp)
                 after_rows,  skipped_a = _read_binary_csv_8bit(ap)
 
-                raw_table, totals = build_table(before_rows, after_rows, self.channel.get())
+                raw_table, totals, b_used, a_used = build_table(before_rows, after_rows, self.channel.get())
                 self._last_raw_table = raw_table
-                self._last_totals = {
+                self._last_totals    = {
                     **totals,
                     "skipped_before": skipped_b,
                     "skipped_after":  skipped_a,
                 }
+                # save aligned per-pixel channel lists for bit-level analysis
+                self._aligned_before_bits = b_used  # list[str] length n_rows
+                self._aligned_after_bits  = a_used  # list[str] length n_rows
 
             if self._last_raw_table is None:
                 return
 
-            # filter rows if needed
+            # apply filters
             table = []
             for b, a, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total in self._last_raw_table:
                 if self.only_changes.get() and b == a:
                     continue
                 table.append([b, a, tied, mapped_star, cb, ca_same, delta_same, pct_loss, mapped_total])
 
-            # sort rows
+            # sort
             sorter = self.sort_by.get()
             if sorter == "FirstSeen":
                 pass
@@ -300,7 +314,7 @@ class App:
             else:  # "Mapped"
                 table.sort(key=lambda r: (-r[3], r[0]))
 
-            # render table to text widget
+            # render to text
             self.text.delete("1.0","end")
 
             header = [
@@ -343,7 +357,7 @@ class App:
                 self.text.insert("end", f"Skipped invalid rows — before: {self._last_totals['skipped_before']}, "
                                          f"after: {self._last_totals['skipped_after']}\n")
 
-            # top combinations section
+            # top combinations
             top_pairs = t["top_pairs"][:20]
             if top_pairs:
                 self.text.insert("end", "\nTop combinations (excluding identity):\n")
@@ -375,14 +389,14 @@ class App:
             messagebox.showinfo("No data", "Compute first, then Show Trend.")
             return
 
-        freq_loss_pairs = [(row[4], row[7]) for row in self._last_raw_table if row[4] > 0]
-        if not freq_loss_pairs:
+        pts = [(row[4], row[7]) for row in self._last_raw_table if row[4] > 0]
+        if not pts:
             messagebox.showinfo("No data", "No valid rows to plot.")
             return
 
-        freq_loss_pairs.sort(key=lambda x: x[0])
-        xs = [cb for (cb, _) in freq_loss_pairs]
-        ys = [pl for (_, pl) in freq_loss_pairs]
+        pts.sort(key=lambda x: x[0])
+        xs = [cb for (cb, _) in pts]
+        ys = [pl for (_, pl) in pts]
 
         plt.figure()
         plt.scatter(xs, ys)
@@ -392,55 +406,72 @@ class App:
         plt.grid(True)
         plt.show()
 
-    # --- NEW plot: average %loss per bit position 0..7 ---
+    # --- NEW plot: per-bit loss using true per-pixel flips ---
     def show_bit_loss(self):
         """
-        For each bit position k (0=LSB .. 7=MSB):
-          - collect pct_loss for all BEFORE codes where that bit is 1
-          - average them
-        Plot bar chart: x = bit index, y = average % loss.
+        For each bit position k (0 = LSB, 7 = MSB):
+          Look across ALL aligned rows (n = min(len(before),len(after)) for this channel).
+
+          For each row i:
+            before_bits = _aligned_before_bits[i]  (8-char "01010101")
+            after_bits  = _aligned_after_bits[i]
+
+            If before_bits[k] was 1 (at that bit position),
+            check if after_bits[k] stayed 1.
+
+          bit_loss_pct[k] = 100 * (# bit1 that dropped) / (# bit1 total)
+
+        IMPORTANT: We are now looking at that singular bit in isolation,
+        not punishing a bit just because OTHER bits in the byte changed.
         """
-        if not self._last_raw_table:
+        if not (self._aligned_before_bits and self._aligned_after_bits):
             messagebox.showinfo("No data", "Compute first, then Show Bit Loss.")
             return
 
-        # buckets[bit] = list of pct_loss values
-        buckets = {k: [] for k in range(8)}
+        before_list = self._aligned_before_bits
+        after_list  = self._aligned_after_bits
 
-        # row[0] = binary string like "10101100"
-        # row[7] = pct_loss for that code
-        for row in self._last_raw_table:
-            bcode = row[0]
-            pct_loss = row[7]
-            if len(bcode) != 8:
+        # We'll treat bit index 0 = LSB (rightmost), 7 = MSB (leftmost)
+        bit_total_ones   = [0]*8  # how many times this bit was 1 in BEFORE
+        bit_survive_ones = [0]*8  # out of those, how many stayed 1 in AFTER
+
+        n = min(len(before_list), len(after_list))
+        for i in range(n):
+            bcode = before_list[i]
+            acode = after_list[i]
+            if len(bcode) != 8 or len(acode) != 8:
                 continue
-            # bit index 0 = LSB (rightmost char), bit index 7 = MSB (leftmost char)
-            # We'll treat bit 0 as bcode[7], bit 7 as bcode[0]
+
+            # map bit_index -> that position: bit 0 = char_index 7, ..., bit 7 = char_index 0
             for bit_index in range(8):
-                # map bit_index -> character index in string
                 char_index = 7 - bit_index
                 if bcode[char_index] == "1":
-                    buckets[bit_index].append(pct_loss)
+                    bit_total_ones[bit_index] += 1
+                    if acode[char_index] == "1":
+                        bit_survive_ones[bit_index] += 1
 
-        avg_loss = []
+        bit_loss_pct = []
         bits = list(range(8))
         for bit_index in bits:
-            vals = buckets[bit_index]
-            if vals:
-                avg_loss.append(sum(vals)/len(vals))
+            total = bit_total_ones[bit_index]
+            if total > 0:
+                survived = bit_survive_ones[bit_index]
+                dropped = total - survived
+                pct_loss = 100.0 * dropped / total
             else:
-                avg_loss.append(0.0)
+                pct_loss = 0.0
+            bit_loss_pct.append(pct_loss)
 
         plt.figure()
-        plt.bar(bits, avg_loss)
+        plt.bar(bits, bit_loss_pct)
         plt.xlabel("Bit position (0 = LSB, 7 = MSB)")
-        plt.ylabel("Average % loss")
-        plt.title(f"Average loss per bit — Channel {self.channel.get()}")
+        plt.ylabel("Average % loss of that bit")
+        plt.title(f"Per-bit survival loss — Channel {self.channel.get()}")
         plt.grid(True, axis="y")
         plt.xticks(bits)
         plt.show()
 
-    # --- CSV export unchanged from last version ---
+    # --- CSV export (unchanged from previous behavior) ---
     def export_csv(self):
         if not self._view_rows:
             messagebox.showinfo("Nothing to export", "Compute first.")
