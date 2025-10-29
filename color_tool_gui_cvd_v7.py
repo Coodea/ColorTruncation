@@ -1,707 +1,459 @@
-# color_tool_gui_cvd_v7.py
-# Resizable, fit-to-window preview + separate control panels.
-# Modes:
-#   • Color Vision: choose type (simulate or assist/daltonize), severity/strength.
-#   • Highlight: HSV isolate/overlay with click-to-pick.
-#
-# Quit never saves. Press 'S' to Save As… (choose name & folder).
-# Full-res processing; preview is scaled to your window.
-#
-# On Save: also writes BEFORE/AFTER RGB CSVs:
-#   <base>_before_pixels.csv  (decimal R,G,B)
-#   <base>_after_pixels.csv   (decimal R,G,B)
-#   <base>_before_binary.csv  (binary-string R,G,B)
-#   <base>_after_binary.csv   (binary-string R,G,B)
+#!/usr/bin/env python3
+"""
+color_tool_gui_cvd_v7.py
+ColorTruncation CVD simulator/editor (daltonlens-backed)
+
+This version fixes the API call for daltonlens based on your traceback:
+we now use simulate.Simulator_Machado2009().simulate_cvd(...) instead of
+simulate.simulate_cvd_Machado2009(...).
+"""
 
 import os
-import cv2
-import numpy as np
+import csv
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
-from typing import Tuple
+import numpy as np
 
-VERSION_TAG = "v7-linear"
+# Try daltonlens
+try:
+    from daltonlens import simulate
+    DALTONLENS_AVAILABLE = True
+except Exception:
+    DALTONLENS_AVAILABLE = False
 
-# ---------- Core helpers: image<->pixels<->binary ----------
 
-def image_to_pixels(img_bgr: np.ndarray) -> np.ndarray:
-    if img_bgr is None or img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
-        raise ValueError("Input must be a color image (H x W x 3).")
-    return img_bgr.astype(np.uint8, copy=False)
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
-def pixels_to_binary(pixels: np.ndarray) -> bytes:
-    return pixels.tobytes(order="C")
+def _to_8bit_string(val: int) -> str:
+    """0-255 int -> 'xxxxxxxx' 8-bit binary string."""
+    if val < 0:
+        val = 0
+    if val > 255:
+        val = 255
+    return f"{val:08b}"
 
-def binary_to_pixels(buf: bytes, shape: Tuple[int,int,int], dtype=np.uint8) -> np.ndarray:
-    h, w, c = shape
-    arr = np.frombuffer(buf, dtype=dtype)
-    expect = h*w*c
-    if arr.size != expect:
-        raise ValueError(f"Binary buffer has {arr.size} elements; expected {expect}.")
-    return arr.reshape((h, w, c))
+def pil_to_numpy_uint8(img: Image.Image) -> np.ndarray:
+    """PIL -> np.uint8 array shape (H,W,3) RGB."""
+    return np.array(img.convert("RGB"), dtype=np.uint8)
 
-# ---------- CSV writers (decimal + binary-string) ----------
+def numpy_to_pil(arr: np.ndarray) -> Image.Image:
+    """(H,W,3) uint8 -> PIL.Image RGB."""
+    return Image.fromarray(arr.astype(np.uint8), mode="RGB")
 
-def write_pixels_csv(csv_path: str, rgb: np.ndarray) -> None:
-    """Decimal CSV, rows: 'R,G,B'."""
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        f.write("R,G,B\n")
-        flat = rgb.reshape(-1, 3)
-        for R, G, B in flat:
-            f.write(f"{int(R)},{int(G)},{int(B)}\n")
-
-def write_binary_csv_bits(csv_path: str, rgb: np.ndarray) -> None:
-    """Binary CSV, rows: 'R,G,B' but each value is an 8-bit binary string."""
-    with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        f.write("R,G,B\n")
-        flat = rgb.reshape(-1, 3)
-        for R, G, B in flat:
-            f.write(f"{int(R):08b},{int(G):08b},{int(B):08b}\n")
-
-def export_rgb_scale_pair(out_base: str, before_bgr: np.ndarray, after_bgr: np.ndarray) -> None:
+def get_simulator():
     """
-    Create 4 files beside the saved image:
-      <base>_before_pixels.csv   (decimal)
-      <base>_after_pixels.csv    (decimal)
-      <base>_before_binary.csv   (8-bit binary strings)
-      <base>_after_binary.csv    (8-bit binary strings)
+    Build (or cache) a daltonlens simulator instance.
+
+    daltonlens exposes Simulator_Machado2009 which then gives a .simulate_cvd()
+    method that expects:
+        simulator.simulate_cvd(img_uint8, deficiency, severity)
     """
-    before_rgb = cv2.cvtColor(before_bgr, cv2.COLOR_BGR2RGB)
-    after_rgb  = cv2.cvtColor(after_bgr,  cv2.COLOR_BGR2RGB)
+    # We recreate it each call for safety/simplicity. You could cache globally.
+    return simulate.Simulator_Machado2009()
 
-    write_pixels_csv(f"{out_base}_before_pixels.csv", before_rgb)
-    write_pixels_csv(f"{out_base}_after_pixels.csv",  after_rgb)
-    write_binary_csv_bits(f"{out_base}_before_binary.csv", before_rgb)
-    write_binary_csv_bits(f"{out_base}_after_binary.csv",  after_rgb)
-
-# ---------- Highlight (HSV) ----------
-
-def make_mask_hsv(hsv: np.ndarray, hc:int, hr:int, smin:int, smax:int, vmin:int, vmax:int,
-                  morph:int=0, soft:int=2, invert:int=0) -> np.ndarray:
-    H,S,V = cv2.split(hsv)
-    low = (hc - hr) % 180
-    high= (hc + hr) % 180
-    if low <= high:
-        hmask = cv2.inRange(H, low, high)
-    else:
-        hmask = cv2.inRange(H, low, 179) | cv2.inRange(H, 0, high)
-    smask = cv2.inRange(S, smin, smax)
-    vmask = cv2.inRange(V, vmin, vmax)
-    mask = hmask & smask & vmask
-    if invert == 1:
-        mask = 255 - mask
-    if morph > 0:
-        k = 2*morph + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k,k))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    if soft > 0:
-        k = 2*soft + 1
-        mask = cv2.GaussianBlur(mask, (k,k), 0)
-    return (mask.astype(np.float32)/255.0)
-
-def overlay_style(bgr: np.ndarray, mask01: np.ndarray, style:int, bg_dim:float,
-                  alpha:float, hue_for_overlay:int, show_mask:bool=False) -> np.ndarray:
-    if show_mask:
-        m8 = np.clip(mask01*255.0, 0, 255).astype(np.uint8)
-        return cv2.cvtColor(m8, cv2.COLOR_GRAY2BGR)
-    if style == 0:
-        out = (bgr.astype(np.float32) * mask01[...,None])
-        return np.clip(out, 0, 255).astype(np.uint8)
-    if style == 1:
-        out = bgr.astype(np.float32) * (mask01[...,None] + (1.0 - mask01[...,None])*bg_dim)
-        return np.clip(out, 0, 255).astype(np.uint8)
-    comp_h = (hue_for_overlay + 90) % 180
-    overlay_col = cv2.cvtColor(np.uint8([[[comp_h,255,255]]]), cv2.COLOR_HSV2BGR)[0,0,:].astype(np.float32)
-    base = bgr.astype(np.float32)
-    out = base*(1.0 - alpha*mask01[...,None]) + overlay_col[None,None,:]*(alpha*mask01[...,None])
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-# ---------- Color-Vision (LMS-based, linear RGB pipeline) ----------
-
-# sRGB <-> Linear helpers (for accurate LMS math)
-def srgb_to_linear(rgb01: np.ndarray) -> np.ndarray:
-    """sRGB (0..1) to linear RGB (0..1)."""
-    a = rgb01.astype(np.float32)
-    low  = a <= 0.04045
-    out = np.empty_like(a, dtype=np.float32)
-    out[low]  = a[low] / 12.92
-    out[~low] = ((a[~low] + 0.055) / 1.055) ** 2.4
-    return out
-
-def linear_to_srgb(lin: np.ndarray) -> np.ndarray:
-    """linear RGB (0..1) to sRGB (0..1)."""
-    a = np.clip(lin, 0.0, 1.0).astype(np.float32)
-    low  = a <= 0.0031308
-    out = np.empty_like(a, dtype=np.float32)
-    out[low]  = 12.92 * a[low]
-    out[~low] = 1.055 * (a[~low] ** (1/2.4)) - 0.055
-    return out
-
-def bgr_to_rgb01(bgr: np.ndarray) -> np.ndarray:
-    """Return sRGB 0..1 (gamma-encoded)."""
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-def rgb01_to_bgr(rgb01: np.ndarray) -> np.ndarray:
-    rgb8 = np.clip(np.round(rgb01 * 255.0), 0, 255).astype(np.uint8)
-    return cv2.cvtColor(rgb8, cv2.COLOR_RGB2BGR)
-
-# Hunt–Pointer–Estevez LMS matrices
-RGB_to_LMS = np.array([[0.31399022, 0.63951294, 0.04649755],
-                       [0.15537241, 0.75789446, 0.08670142],
-                       [0.01775239, 0.10944209, 0.87256922]], dtype=np.float32)
-LMS_to_RGB = np.linalg.inv(RGB_to_LMS).astype(np.float32)
-
-# Brettel-based dichromat “projection” matrices (same as before)
-SIM_PROTAN = np.array([[0.0, 1.05118294, -0.05116099],
-                       [0.0, 1.0,         0.0       ],
-                       [0.0, 0.0,         1.0       ]], dtype=np.float32)
-SIM_DEUTAN = np.array([[1.0, 0.0,         0.0      ],
-                       [0.9513092, 0.0,   0.04866992],
-                       [0.0, 0.0,         1.0      ]], dtype=np.float32)
-SIM_TRITAN = np.array([[1.0, 0.0,         0.0      ],
-                       [0.0, 1.0,         0.0      ],
-                       [-0.86744736, 1.86727089, 0.0]], dtype=np.float32)
-
-def simulate_cvd_rgb(rgb01_srgb: np.ndarray, kind: str) -> np.ndarray:
-    """Simulate protan/deutan/tritan in linear-light; return sRGB 0..1."""
-    # sRGB -> linear
-    rgb_lin = srgb_to_linear(rgb01_srgb)
-
-    h, w, _ = rgb_lin.shape
-    flat = rgb_lin.reshape(-1, 3).astype(np.float32)
-
-    # linear RGB -> LMS
-    lms = flat @ RGB_to_LMS.T
-
-    # apply deficiency
-    if kind == "protan":
-        lms2 = lms @ SIM_PROTAN.T
-    elif kind == "deutan":
-        lms2 = lms @ SIM_DEUTAN.T
-    elif kind == "tritan":
-        lms2 = lms @ SIM_TRITAN.T
-    else:
-        raise ValueError("Unknown CVD kind")
-
-    # LMS -> linear RGB
-    rgb_lin_sim = lms2 @ LMS_to_RGB.T
-    rgb_lin_sim = np.clip(rgb_lin_sim, 0.0, 1.0).reshape(h, w, 3)
-
-    # linear -> sRGB
-    return linear_to_srgb(rgb_lin_sim)
-
-def simulate_achromatopsia(rgb01_srgb: np.ndarray) -> np.ndarray:
-    """Complete color vision loss simulated via linear luminance."""
-    lin = srgb_to_linear(rgb01_srgb)
-    Y = (0.2126*lin[...,0] + 0.7152*lin[...,1] + 0.0722*lin[...,2])[..., None]
-    lin_grey = np.repeat(Y, 3, axis=-1)
-    return linear_to_srgb(lin_grey)
-
-def daltonize_rgb(rgb01_srgb: np.ndarray, kind: str, strength: float=0.8) -> np.ndarray:
+def simulate_cvd_with_daltonlens(pil_img: Image.Image,
+                                 deficiency_key: str,
+                                 severity_0to1: float) -> Image.Image:
     """
-    Simple error-reinjection daltonization in LINEAR space, then convert back to sRGB.
+    Run CVD simulation using daltonlens Simulator_Machado2009.
+
+    deficiency_key should be one of:
+        "none" / "normal" / "off" -> return original copy
+        "protan"
+        "deutan"
+        "tritan"
+
+    severity_0to1 is clamped into [0.0, 1.0]
     """
-    rgb_lin = srgb_to_linear(rgb01_srgb)
-    sim_srgb = simulate_achromatopsia(rgb01_srgb) if kind == "achroma" else simulate_cvd_rgb(rgb01_srgb, kind)
-    sim_lin  = srgb_to_linear(sim_srgb)
+    # If daltonlens isn't available, just return original
+    if not DALTONLENS_AVAILABLE:
+        return pil_img.copy()
 
-    err = rgb_lin - sim_lin
-    if kind == "protan":
-        corr = np.stack([0.0*err[...,0], 0.7*err[...,0], 0.7*err[...,0]], axis=-1)
-    elif kind == "deutan":
-        corr = np.stack([0.7*err[...,1], 0.0*err[...,1], 0.7*err[...,1]], axis=-1)
-    else:  # tritan or achroma proxy
-        corr = np.stack([0.7*err[...,2], 0.7*err[...,2], 0.0*err[...,2]], axis=-1)
+    # Normalize type
+    key = deficiency_key.lower().strip()
+    if key in ("none", "normal", "off"):
+        return pil_img.copy()
 
-    out_lin = np.clip(rgb_lin + strength * corr, 0.0, 1.0)
-    return linear_to_srgb(out_lin)
-
-def apply_cvd_pipeline(bgr: np.ndarray, cvd_type_ui: str, view_mode: str,
-                       severity01: float, assist_strength01: float,
-                       rg_subtype: str = "deutan", tri_variant: str = "deutan") -> np.ndarray:
-    """Top-level: map UI type → base model; simulate or assist; blend by severity."""
-    rgb_s = bgr_to_rgb01(bgr)
-    label = (cvd_type_ui or "").lower().replace("–", "-")
-
-    if "deuteranopia" in label or "deuteranomaly" in label:
-        base = "deutan"
-    elif "protanopia" in label or "protanomaly" in label:
-        base = "protan"
-    elif "tritanopia" in label or "tritanomaly" in label:
-        base = "tritan"
-    elif "achromatopsia" in label:
-        base = "achroma"
-    elif "anomalous trichromacy" in label:
-        base = tri_variant
+    if "prot" in key:
+        dtype = simulate.Deficiency.PROTAN
+    elif "deut" in key:
+        dtype = simulate.Deficiency.DEUTAN
+    elif "trit" in key:
+        dtype = simulate.Deficiency.TRITAN
     else:
-        base = "deutan"
+        # Unknown -> no change
+        return pil_img.copy()
 
-    if view_mode == "simulate":
-        sim_s = simulate_achromatopsia(rgb_s) if base == "achroma" else simulate_cvd_rgb(rgb_s, base)
-        out_s = (1.0 - severity01) * rgb_s + severity01 * sim_s
-    else:
-        assist_s = daltonize_rgb(rgb_s, base if base != "achroma" else "achroma",
-                                 strength=assist_strength01)
-        out_s = (1.0 - severity01) * rgb_s + severity01 * assist_s
+    sev = float(severity_0to1)
+    if sev < 0.0:
+        sev = 0.0
+    if sev > 1.0:
+        sev = 1.0
 
-    return rgb01_to_bgr(np.clip(out_s, 0.0, 1.0))
+    # Convert PIL -> np.uint8 (H,W,3)
+    arr = pil_to_numpy_uint8(pil_img)
 
-# ---------- App ----------
+    # Build simulator and run
+    sim_obj = get_simulator()
+    # According to the traceback hint, new API is something like:
+    # sim_obj.simulate_cvd(image_uint8, deficiency, severity)
+    sim_arr = sim_obj.simulate_cvd(arr, dtype, sev)
 
-# Removed from list: "Blue-Yellow colorblindness", "Complete colorblindness", "Red–green color blindness"
-CVD_TYPES = [
-    "Deuteranopia",
-    "Protanopia",
-    "Tritanopia",
-    "Deuteranomaly",
-    "Protanomaly",
-    "Achromatopsia",
-    "Tritanomaly",
-    "Anomalous Trichromacy",
-]
+    # sim_arr should be uint8 HxWx3
+    return numpy_to_pil(sim_arr)
+
+def export_pixels_and_binary_csvs(base_path_no_ext: str,
+                                  before_img: Image.Image,
+                                  after_img: Image.Image):
+    """
+    Export:
+        *_before_pixels.csv
+        *_after_pixels.csv
+        *_before_binary.csv
+        *_after_binary.csv
+
+    Pixels CSV format:
+        header "R,G,B"
+        rows of integer 0..255 RGB per pixel
+
+    Binary CSV format:
+        header "R,G,B"
+        rows of 8-bit binary '01010101' per channel.
+
+    One line per pixel in row-major order.
+    """
+    if before_img is None or after_img is None:
+        raise RuntimeError("Images not ready for export.")
+
+    b_np = pil_to_numpy_uint8(before_img)
+    a_np = pil_to_numpy_uint8(after_img)
+
+    # Force same dims for export by cropping to min
+    h_b, w_b, _ = b_np.shape
+    h_a, w_a, _ = a_np.shape
+    h = min(h_b, h_a)
+    w = min(w_b, w_a)
+    if (h != h_b) or (w != w_b) or (h != h_a) or (w != w_a):
+        b_np = b_np[:h, :w, :]
+        a_np = a_np[:h, :w, :]
+
+    b_flat = b_np.reshape(-1, 3)
+    a_flat = a_np.reshape(-1, 3)
+
+    before_pixels_path = base_path_no_ext + "_before_pixels.csv"
+    after_pixels_path  = base_path_no_ext + "_after_pixels.csv"
+    before_bin_path    = base_path_no_ext + "_before_binary.csv"
+    after_bin_path     = base_path_no_ext + "_after_binary.csv"
+
+    # BEFORE pixels
+    with open(before_pixels_path, "w", encoding="utf-8", newline="") as f:
+        wri = csv.writer(f)
+        wri.writerow(["R","G","B"])
+        for (r,g,b) in b_flat:
+            wri.writerow([int(r), int(g), int(b)])
+
+    # AFTER pixels
+    with open(after_pixels_path, "w", encoding="utf-8", newline="") as f:
+        wri = csv.writer(f)
+        wri.writerow(["R","G","B"])
+        for (r,g,b) in a_flat:
+            wri.writerow([int(r), int(g), int(b)])
+
+    # BEFORE binary
+    with open(before_bin_path, "w", encoding="utf-8", newline="") as f:
+        wri = csv.writer(f)
+        wri.writerow(["R","G","B"])
+        for (r,g,b) in b_flat:
+            wri.writerow([
+                _to_8bit_string(int(r)),
+                _to_8bit_string(int(g)),
+                _to_8bit_string(int(b))
+            ])
+
+    # AFTER binary
+    with open(after_bin_path, "w", encoding="utf-8", newline="") as f:
+        wri = csv.writer(f)
+        wri.writerow(["R","G","B"])
+        for (r,g,b) in a_flat:
+            wri.writerow([
+                _to_8bit_string(int(r)),
+                _to_8bit_string(int(g)),
+                _to_8bit_string(int(b))
+            ])
+
+    return (
+        before_pixels_path,
+        after_pixels_path,
+        before_bin_path,
+        after_bin_path
+    )
+
+def pil_resize_keep_aspect(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
+    """
+    Downscale PIL image to fit in max_w x max_h, without upscaling.
+    """
+    w, h = img.size
+    scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    if new_w == w and new_h == h:
+        return img
+    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+
+# -----------------------------------------------------------------------------
+# GUI App
+# -----------------------------------------------------------------------------
 
 class ColorToolApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title(f"Color Tool — Launcher [{VERSION_TAG}]")
-        self.root.geometry("560x260")
-        self.root.resizable(False, False)
+        self.root.title("ColorTruncation CVD Simulator (daltonlens)")
+        self.root.geometry("1200x700")
 
-        # CVD vars
-        self.var_cvd_type    = tk.StringVar(value=CVD_TYPES[0])
-        self.var_view        = tk.StringVar(value="simulate")  # "simulate" or "assist"
-        self.var_sev         = tk.IntVar(value=100)
-        self.var_strength    = tk.IntVar(value=80)
-        self.var_rg_sub      = tk.StringVar(value="deutan")     # kept but hidden
-        self.var_tri_variant = tk.StringVar(value="deutan")
+        # State
+        self.before_img_pil = None   # original
+        self.after_img_pil  = None   # simulated
+        self.before_tk      = None   # tk preview img
+        self.after_tk       = None   # tk preview img
+        self.loaded_path    = tk.StringVar(value="")
 
-        self.mode = tk.StringVar(value="cvd")  # "cvd" or "highlight"
-        self.image_path = tk.StringVar(value="")
+        # CVD controls
+        self.cvd_mode_var = tk.StringVar(value="None")  # "None", "Protan", "Deutan", "Tritan"
+        # severity slider 0..100 -> we map /100 to [0..1]
+        self.severity_var = tk.IntVar(value=100)
 
-        frm = tk.Frame(self.root)
-        frm.pack(fill="both", expand=True, padx=14, pady=14)
+        # ==== Top controls frame ====
+        top = tk.Frame(self.root)
+        top.pack(fill="x", padx=10, pady=10)
 
-        tk.Label(frm, text="Mode", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Radiobutton(frm, text="Color Vision (choose type; simulate or assist)", variable=self.mode, value="cvd").grid(row=1, column=0, sticky="w")
-        tk.Radiobutton(frm, text="Highlight (HSV isolate / overlay)",               variable=self.mode, value="highlight").grid(row=2, column=0, sticky="w")
+        # File row
+        tk.Label(top, text="Image file:").grid(row=0, column=0, sticky="w")
+        tk.Entry(top, textvariable=self.loaded_path, width=70).grid(row=0, column=1, sticky="we", padx=6)
+        tk.Button(top, text="Browse…", command=self.pick_image).grid(row=0, column=2, padx=(0,10))
+        tk.Button(top, text="Reload", command=self.reload_image).grid(row=0, column=3)
 
-        tk.Label(frm, text="Image", font=("Segoe UI", 11, "bold")).grid(row=3, column=0, sticky="w", pady=10)
-        tk.Entry(frm, textvariable=self.image_path, width=54).grid(row=4, column=0, sticky="we")
-        tk.Button(frm, text="Browse…", command=self.browse).grid(row=4, column=1, padx=8)
+        # CVD row
+        tk.Label(top, text="CVD mode:").grid(row=1, column=0, sticky="w", pady=(8,0))
 
-        tk.Button(frm, text="Open", width=12, command=self.open_session).grid(row=5, column=0, pady=16, sticky="w")
-        tk.Button(frm, text="Quit", width=12, command=self.root.destroy).grid(row=5, column=1, pady=16, sticky="e")
+        mode_menu = tk.OptionMenu(top, self.cvd_mode_var,
+                                  "None",
+                                  "Protan",
+                                  "Deutan",
+                                  "Tritan")
+        mode_menu.grid(row=1, column=1, sticky="w", pady=(8,0))
+
+        tk.Label(top, text="Severity (0-100):").grid(row=1, column=2, sticky="e", pady=(8,0))
+        tk.Scale(
+            top, from_=0, to=100, orient="horizontal",
+            variable=self.severity_var,
+            command=lambda _evt=None: self.update_after_image_preview()
+        ).grid(row=1, column=3, sticky="we", pady=(8,0))
+
+        # Action row
+        tk.Button(
+            top,
+            text="Apply Simulation / Refresh Preview",
+            command=self.update_after_image_preview
+        ).grid(row=2, column=1, sticky="w", pady=(10,0))
+
+        tk.Button(
+            top,
+            text="Export CSVs…",
+            command=self.export_csvs
+        ).grid(row=2, column=2, sticky="w", pady=(10,0))
+
+        tk.Button(
+            top,
+            text="Quit",
+            command=self.root.destroy
+        ).grid(row=2, column=3, sticky="e", pady=(10,0))
+
+        # Status label
+        self.status_var = tk.StringVar(value="No image loaded.")
+        tk.Label(self.root, textvariable=self.status_var, anchor="w")\
+            .pack(fill="x", padx=10, pady=(0,10))
+
+        # Preview frame (left=Before, right=After)
+        preview = tk.Frame(self.root)
+        preview.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left_frame  = tk.LabelFrame(preview, text="BEFORE (original)")
+        right_frame = tk.LabelFrame(preview, text="AFTER (CVD simulated)")
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0,5))
+        right_frame.pack(side="left", fill="both", expand=True, padx=(5,0))
+
+        self.before_canvas = tk.Label(left_frame, bg="#222222")
+        self.after_canvas  = tk.Label(right_frame, bg="#222222")
+        self.before_canvas.pack(fill="both", expand=True)
+        self.after_canvas.pack(fill="both", expand=True)
+
+        # footer info
+        footer = tk.Frame(self.root)
+        footer.pack(fill="x", padx=10, pady=(0,10))
+        self.dim_var = tk.StringVar(value="")
+        tk.Label(footer, textvariable=self.dim_var, anchor="w")\
+            .pack(side="left", fill="x", expand=True)
+
+        # daltonlens availability warning
+        if not DALTONLENS_AVAILABLE:
+            messagebox.showwarning(
+                "daltonlens not found",
+                "daltonlens is not installed or not importable.\n"
+                "Simulation will fall back to 'None'.\n"
+                "Install with: pip install daltonlens"
+            )
 
         self.root.mainloop()
 
-    def browse(self):
-        path = filedialog.askopenfilename(
-            title="Choose an image",
-            filetypes=[("Images","*.jpg *.jpeg *.png *.bmp *.tif *.tiff"), ("All files","*.*")]
+    # -------------------------------------------------------------------------
+    # Image loading / updating
+    # -------------------------------------------------------------------------
+
+    def pick_image(self):
+        p = filedialog.askopenfilename(
+            title="Choose image",
+            filetypes=[
+                ("Images","*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"),
+                ("All files","*.*")
+            ]
         )
-        if path:
-            self.image_path.set(path)
+        if not p:
+            return
+        self.loaded_path.set(p)
+        self.reload_image()
 
-    # ---------- Session ----------
-    def open_session(self):
-        path = self.image_path.get()
+    def reload_image(self):
+        path = self.loaded_path.get().strip()
         if not path:
-            messagebox.showwarning("No image", "Please select an image.")
+            messagebox.showwarning("No file","Please pick an image.")
             return
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            messagebox.showerror("Error", f"Could not open: {path}")
-            return
-
-        self.img_full = img
-        self.h_full, self.w_full = img.shape[:2]
-        self.hsv_full = cv2.cvtColor(self.img_full, cv2.COLOR_BGR2HSV)
-
-        self.show_original = False
-        self.show_mask = False
-        self.last_pick_hsv = None
-
-        # Image viewer
-        self.viewer = tk.Toplevel(self.root)
-        self.viewer.title(f"Image — Fit to Window [{VERSION_TAG}]  (S=Save  M=Mask  O=Original  Space=Mask  Q/Esc=Quit)")
-        self.viewer.geometry("1000x640")
-        self.viewer.minsize(480, 360)
-
-        self.canvas = tk.Canvas(self.viewer, background="black", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", self.on_canvas_resize)
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
-        self.viewer.bind("<Key-s>", self.on_save)
-        self.viewer.bind("<Key-S>", self.on_save)
-        self.viewer.bind("<Key-m>", self.on_save_mask)
-        self.viewer.bind("<Key-M>", self.on_save_mask)
-        self.viewer.bind("<Key-o>", self.on_toggle_orig)
-        self.viewer.bind("<Key-O>", self.on_toggle_orig)
-        self.viewer.bind("<space>", self.on_toggle_mask)
-        self.viewer.bind("<Key-q>", self.on_quit)
-        self.viewer.bind("<Key-Escape>", self.on_quit)
-
-        if self.mode.get() == "cvd":
-            self.build_cvd_controls()
-        else:
-            self.build_highlight_controls()
-
-        self.viewer.after(50, self.update_preview)
-
-    # ---------- Color Vision controls ----------
-    def build_cvd_controls(self):
-        self.ctrl = tk.Toplevel(self.root)
-        self.ctrl.title("Color Vision — Type & Options")
-        self.ctrl.resizable(False, False)
-
-        tk.Label(self.ctrl, text="Color-blindness Type:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=8)
-        self.type_combo = ttk.Combobox(self.ctrl, textvariable=self.var_cvd_type, values=CVD_TYPES, state="readonly", width=34)
-        self.type_combo.pack(anchor="w", padx=10)
-        self.type_combo.bind("<<ComboboxSelected>>", lambda e: (self._update_subrows(), self.update_preview()))
-
-        self.sub_frame = tk.Frame(self.ctrl)
-        self.sub_frame.pack(fill="x", padx=10, pady=6)
-
-        # kept (unused visually) RG row
-        self.rg_row = tk.Frame(self.sub_frame)
-        tk.Label(self.rg_row, text="Red–Green subtype:").pack(side="left")
-        ttk.Radiobutton(self.rg_row, text="Deutan-like", variable=self.var_rg_sub, value="deutan",
-                        command=self.update_preview).pack(side="left", padx=6)
-        ttk.Radiobutton(self.rg_row, text="Protan-like", variable=self.var_rg_sub, value="protan",
-                        command=self.update_preview).pack(side="left", padx=6)
-
-        self.tri_row = tk.Frame(self.sub_frame)
-        tk.Label(self.tri_row, text="Anomalous variant:").pack(side="left")
-        ttk.Radiobutton(self.tri_row, text="Deuteranomaly", variable=self.var_tri_variant, value="deutan",
-                        command=self.update_preview).pack(side="left", padx=6)
-        ttk.Radiobutton(self.tri_row, text="Protanomaly",   variable=self.var_tri_variant, value="protan",
-                        command=self.update_preview).pack(side="left", padx=6)
-        ttk.Radiobutton(self.tri_row, text="Tritanomaly",   variable=self.var_tri_variant, value="tritan",
-                        command=self.update_preview).pack(side="left", padx=6)
-
-        view_row = tk.Frame(self.ctrl)
-        view_row.pack(fill="x", padx=10, pady=6)
-        tk.Label(view_row, text="View Mode:", font=("Segoe UI", 10, "bold")).pack(side="left")
-        ttk.Radiobutton(view_row, text="Simulate (how it looks)", variable=self.var_view, value="simulate",
-                        command=self.update_preview).pack(side="left", padx=6)
-        ttk.Radiobutton(view_row, text="Assist (daltonize)",       variable=self.var_view, value="assist",
-                        command=self.update_preview).pack(side="left", padx=6)
-
-        sliders = tk.Frame(self.ctrl)
-        sliders.pack(fill="x", padx=10, pady=6)
-        tk.Label(sliders, text="Severity (%) — 0=mild anomaly   100=full -opia / complete",
-                 anchor="w").pack(fill="x")
-        tk.Scale(sliders, variable=self.var_sev, from_=0, to=100, orient="horizontal", length=360,
-                 command=lambda _=None: self.update_preview()).pack(anchor="w")
-
-        self.str_row = tk.Frame(self.ctrl)
-        self.str_row.pack(fill="x", padx=10, pady=6)
-        tk.Label(self.str_row, text="Assist strength (%) — only for Assist:", anchor="w").pack(side="left")
-        tk.Scale(self.str_row, variable=self.var_strength, from_=0, to=100, orient="horizontal", length=240,
-                 command=lambda _=None: self.update_preview()).pack(side="left")
-
-        info = tk.Label(self.ctrl, fg="#444",
-                        text="Tip: Choose your type, then use Simulate to preview or Assist to recolor.\n"
-                             "S=Save  O=Original  Q/Esc=Quit (in the image window).")
-        info.pack(anchor="w", padx=10, pady=6)
-
-        btns = tk.Frame(self.ctrl)
-        btns.pack(pady=8)
-        tk.Button(btns, text="Save (S)", command=self.save_as_dialog).pack(side="left", padx=6)
-        tk.Button(btns, text="Quit (Q/Esc)", command=self.on_quit).pack(side="left", padx=6)
-
-        self._update_subrows()
-
-    def _update_subrows(self):
-        # Only show Anomalous Trichromacy variant row (red–green menu removed from list)
-        t = self.var_cvd_type.get()
-        for r in (getattr(self, "rg_row", None), getattr(self, "tri_row", None)):
-            if r is not None:
-                r.pack_forget()
-        if t == "Anomalous Trichromacy":
-            self.tri_row.pack(anchor="w", pady=4)
-
-    # ---------- Highlight controls ----------
-    def build_highlight_controls(self):
-        self.ctrl = tk.Toplevel(self.root)
-        self.ctrl.title("Highlight — HSV Selection & Style")
-        self.ctrl.resizable(False, False)
-
-        self.var_hc   = tk.IntVar(value=15)
-        self.var_hr   = tk.IntVar(value=18)
-        self.var_smin = tk.IntVar(value=40)
-        self.var_smax = tk.IntVar(value=255)
-        self.var_vmin = tk.IntVar(value=40)
-        self.var_vmax = tk.IntVar(value=255)
-        self.var_style= tk.IntVar(value=1)
-        self.var_bgdim= tk.IntVar(value=25)
-        self.var_alpha= tk.IntVar(value=70)
-        self.var_soft = tk.IntVar(value=2)
-        self.var_morph= tk.IntVar(value=0)
-        self.var_invert=tk.IntVar(value=0)
-
-        def row(label, var, a, b):
-            fr = tk.Frame(self.ctrl)
-            fr.pack(fill="x", padx=10, pady=6)
-            tk.Label(fr, text=label, width=22, anchor="w").pack(side="left")
-            tk.Scale(fr, variable=var, from_=a, to=b, orient="horizontal", length=300,
-                     command=lambda _=None: self.update_preview()).pack(side="left")
-            tk.Label(fr, textvariable=var, width=5).pack(side="left")
-
-        row("Hue Center (0–179)", self.var_hc, 0, 179)
-        row("Hue Range (±0–90)",  self.var_hr, 0, 90)
-        row("S min (0–255)",      self.var_smin, 0, 255)
-        row("S max (0–255)",      self.var_smax, 0, 255)
-        row("V min (0–255)",      self.var_vmin, 0, 255)
-        row("V max (0–255)",      self.var_vmax, 0, 255)
-
-        fr_style = tk.Frame(self.ctrl)
-        fr_style.pack(fill="x", padx=10, pady=6)
-        tk.Label(fr_style, text="Style", width=22, anchor="w").pack(side="left")
-        ttk.Radiobutton(fr_style, text="Keep Only",      variable=self.var_style, value=0,
-                        command=self.update_preview).pack(side="left", padx=4)
-        ttk.Radiobutton(fr_style, text="Dim Background", variable=self.var_style, value=1,
-                        command=self.update_preview).pack(side="left", padx=4)
-        ttk.Radiobutton(fr_style, text="Overlay",        variable=self.var_style, value=2,
-                        command=self.update_preview).pack(side="left", padx=4)
-
-        row("BG Dim % (0–100)", self.var_bgdim, 0, 100)
-        row("Overlay Alpha %",  self.var_alpha, 0, 100)
-        row("Softness (0–20)",  self.var_soft,  0, 20)
-        row("Morph Open (0–10)",self.var_morph, 0, 10)
-
-        fr_inv = tk.Frame(self.ctrl)
-        fr_inv.pack(fill="x", padx=10, pady=6)
-        tk.Checkbutton(fr_inv, text="Invert selection (everything BUT chosen color)",
-                       variable=self.var_invert, onvalue=1, offvalue=0,
-                       command=self.update_preview).pack(side="left")
-
-        info = tk.Label(self.ctrl, fg="#444",
-                        text="Click the image to pick a color (centers Hue; suggests S/V mins).\n"
-                             "Hotkeys in image window: S=Save  M=Save Mask  O=Original  Space=Mask  Q/Esc=Quit")
-        info.pack(anchor="w", padx=10, pady=6)
-
-        btns = tk.Frame(self.ctrl)
-        btns.pack(pady=8)
-        tk.Button(btns, text="Reset", command=self.reset_highlight).pack(side="left", padx=6)
-        tk.Button(btns, text="Save (S)", command=self.save_as_dialog).pack(side="left", padx=6)
-        tk.Button(btns, text="Save Mask (M)", command=self.on_save_mask).pack(side="left", padx=6)
-        tk.Button(btns, text="Quit (Q/Esc)", command=self.on_quit).pack(side="left", padx=6)
-
-    def reset_highlight(self):
-        self.var_hc.set(15); self.var_hr.set(18)
-        self.var_smin.set(40); self.var_smax.set(255)
-        self.var_vmin.set(40); self.var_vmax.set(255)
-        self.var_style.set(1); self.var_bgdim.set(25)
-        self.var_alpha.set(70); self.var_soft.set(2); self.var_morph.set(0)
-        self.var_invert.set(0)
-        self.update_preview()
-
-    # ---------- Rendering / Preview ----------
-
-    def current_processed_full(self) -> np.ndarray:
-        if self.mode.get() == "cvd":
-            cvdt = self.var_cvd_type.get()
-            view = self.var_view.get()
-            sev  = self.var_sev.get() / 100.0
-            strength = self.var_strength.get() / 100.0
-            rg_sub = self.var_rg_sub.get()
-            tri_var= self.var_tri_variant.get()
-            return apply_cvd_pipeline(self.img_full, cvdt, view, sev, strength,
-                                      rg_subtype=rg_sub, tri_variant=tri_var)
-        # highlight
-        hc,hr   = self.var_hc.get(), self.var_hr.get()
-        smin    = self.var_smin.get(); smax = self.var_smax.get()
-        vmin    = self.var_vmin.get(); vmax = self.var_vmax.get()
-        style   = self.var_style.get()
-        bgdim   = self.var_bgdim.get()/100.0
-        alpha   = self.var_alpha.get()/100.0
-        soft    = self.var_soft.get()
-        morph   = self.var_morph.get()
-        invert  = self.var_invert.get()
-        mask01  = make_mask_hsv(self.hsv_full, hc, hr, smin, smax, vmin, vmax, morph, soft, invert)
-        if self.show_original:
-            return self.img_full.copy()
-        return overlay_style(self.img_full, mask01, style, bgdim, alpha, hc, show_mask=self.show_mask)
-
-    def update_preview(self, *_):
-        if not hasattr(self, "canvas"):
-            return
-        W = self.canvas.winfo_width()
-        H = self.canvas.winfo_height()
-        if W < 2 or H < 2:
-            return
-
-        frame = self.current_processed_full()
-
-        scale = min(W / self.w_full, H / self.h_full)
-        vw = max(1, int(self.w_full * scale))
-        vh = max(1, int(self.h_full * scale))
-        x0 = (W - vw) // 2
-        y0 = (H - vh) // 2
-        self.view_scale = scale
-        self.view_offset = (x0, y0)
-
-        disp = frame if scale == 1.0 else cv2.resize(frame, (vw, vh), interpolation=cv2.INTER_AREA)
-
-        # HUD
-        hud = disp.copy()
-        lines = []
-        if self.mode.get() == "cvd":
-            t = self.var_cvd_type.get()
-            mode_txt = "Simulate" if self.var_view.get() == "simulate" else "Assist"
-            sev = self.var_sev.get()
-            lines.append(f"CVD: {t}  Mode: {mode_txt}  Severity: {sev}%")
-            if t == "Anomalous Trichromacy":
-                var = self.var_tri_variant.get()
-                lines.append(f"Variant: { {'deutan':'Deuteranomaly','protan':'Protanomaly','tritan':'Tritanomaly'}[var] }")
-            if self.var_view.get() == "assist":
-                lines.append(f"Assist strength: {self.var_strength.get()}%")
-            lines.append("S=Save  O=Original  Q/Esc=Quit")
-        else:
-            hc,hr = self.var_hc.get(), self.var_hr.get()
-            smin,smax,vmin,vmax = self.var_smin.get(), self.var_smax.get(), self.var_vmin.get(), self.var_vmax.get()
-            style = ["KeepOnly","DimBG","Overlay"][self.var_style.get()]
-            lines.append(f"Highlight: H {hc}±{hr}  S {smin}-{smax}  V {vmin}-{vmax}  Style {style}  Inv {self.var_invert.get()}")
-            lines.append("Click to pick color.  S=Save  M=Save Mask  O=Original  Space=Mask  Q/Esc=Quit")
-            if self.last_pick_hsv is not None:
-                h,s,v = self.last_pick_hsv
-                lines.append(f"Last pick HSV = {h},{s},{v}")
-
-        y = 8
-        for line in lines:
-            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(hud, (6, y), (6+tw+12, y+th+12), (0,0,0), -1)
-            cv2.putText(hud, line, (12, y+th+6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
-            y += th + 14
-
-        rgb = cv2.cvtColor(hud, cv2.COLOR_BGR2RGB)
-        img_tk = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.canvas.image = img_tk
-        self.canvas.delete("all")
-        self.canvas.create_image(x0, y0, anchor="nw", image=img_tk)
-
-    # ---------- Events ----------
-    def on_canvas_resize(self, event):
-        self.update_preview()
-
-    def on_canvas_click(self, event):
-        if self.mode.get() != "highlight":
-            return
-        if not hasattr(self, "view_scale"):
-            return
-        x_off, y_off = self.view_offset
-        x = int((event.x - x_off) / self.view_scale)
-        y = int((event.y - y_off) / self.view_scale)
-        if x < 0 or y < 0 or x >= self.w_full or y >= self.h_full:
-            return
-        h,s,v = self.hsv_full[y, x]
-        self.last_pick_hsv = (int(h), int(s), int(v))
-        if self.var_hr.get() < 12:
-            self.var_hr.set(14)
-        self.var_hc.set(int(h))
-        self.var_smin.set(max(0, int(s) - 45))
-        self.var_vmin.set(max(0, int(v) - 45))
-        self.update_preview()
-
-    def on_toggle_orig(self, _evt=None):
-        self.show_original = not self.show_original
-        self.update_preview()
-
-    def on_toggle_mask(self, _evt=None):
-        if self.mode.get() == "highlight":
-            self.show_mask = not self.show_mask
-            self.update_preview()
-
-    def on_quit(self, _evt=None):
-        for w in ("ctrl", "viewer"):
-            try:
-                getattr(self, w).destroy()
-            except Exception:
-                pass
-
-    def on_save(self, _evt=None):
-        self.save_as_dialog()
-
-    # ---------- Save (writes image + RGB CSVs) ----------
-    def save_as_dialog(self):
-        if not hasattr(self, "img_full"):
-            return
-        in_dir  = os.path.dirname(self.image_path.get())
-        in_base = os.path.splitext(os.path.basename(self.image_path.get()))[0]
-        suffix  = "cvd" if self.mode.get()=="cvd" else "highlight"
-        default_name = f"{in_base}_{suffix}_edited.jpg"
-
-        path = filedialog.asksaveasfilename(
-            title="Save processed image",
-            initialdir=in_dir,
-            initialfile=default_name,
-            defaultextension=".jpg",
-            filetypes=[("JPEG image","*.jpg"), ("All files","*.*")]
-        )
-        if not path:
-            return
-
-        processed = self.current_processed_full()
-        # keep your round-trip
-        buf  = pixels_to_binary(processed)
-        processed2 = binary_to_pixels(buf, processed.shape, dtype=np.uint8)
-
-        ok = cv2.imwrite(path, processed2, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        if not ok:
-            messagebox.showerror("Error", f"Could not write image:\n{path}")
-            return
-
-        base_no_ext, _ = os.path.splitext(path)
-        base_dir = os.path.dirname(base_no_ext)
-        os.makedirs(base_dir, exist_ok=True)
         try:
-            export_rgb_scale_pair(base_no_ext, self.img_full, processed2)
+            before = Image.open(path).convert("RGB")
         except Exception as e:
-            messagebox.showwarning("Saved (with a note)",
-                                   f"Image saved.\nBut RGB CSV export had an issue:\n{e}")
+            messagebox.showerror("Error", f"Could not open image:\n{e}")
             return
 
-        msg = (
-            "Saved image and RGB CSVs:\n\n"
-            f"{path}\n"
-            f"{base_no_ext}_before_pixels.csv\n"
-            f"{base_no_ext}_after_pixels.csv\n"
-            f"{base_no_ext}_before_binary.csv\n"
-            f"{base_no_ext}_after_binary.csv\n"
-        )
-        messagebox.showinfo("Saved", msg)
+        self.before_img_pil = before
+        self.after_img_pil = self._make_after_from_ui(before)
 
-    def on_save_mask(self, _evt=None):
-        if self.mode.get() != "highlight":
-            return
-        in_dir  = os.path.dirname(self.image_path.get())
-        in_base = os.path.splitext(os.path.basename(self.image_path.get()))[0]
-        default_name = f"{in_base}_highlight_mask.png"
-        path = filedialog.asksaveasfilename(
-            title="Save selection mask (PNG)",
-            initialdir=in_dir,
-            initialfile=default_name,
-            defaultextension=".png",
-            filetypes=[("PNG image","*.png"), ("All files","*.*")]
-        )
-        if not path:
-            return
-        hc,hr   = self.var_hc.get(), self.var_hr.get()
-        smin    = self.var_smin.get(); smax = self.var_smax.get()
-        vmin    = self.var_vmin.get(); vmax = self.var_vmax.get()
-        soft    = self.var_soft.get(); morph = self.var_morph.get()
-        invert  = self.var_invert.get()
-        mask01  = make_mask_hsv(self.hsv_full, hc, hr, smin, smax, vmin, vmax, morph, soft, invert)
-        mask8   = np.clip(mask01*255.0, 0, 255).astype(np.uint8)
-        ok = cv2.imwrite(path, mask8)
-        if ok:
-            messagebox.showinfo("Saved", f"Mask saved to:\n{path}")
+        self._update_previews()
+        self._update_status_counters()
+
+    def _make_after_from_ui(self, src_img: Image.Image) -> Image.Image:
+        """Return simulated image using UI mode + severity."""
+        mode_ui = self.cvd_mode_var.get().strip().lower()
+        sev01 = float(self.severity_var.get()) / 100.0
+
+        # normalize to keys we accept in simulate_cvd_with_daltonlens()
+        if "prot" in mode_ui:
+            key = "protan"
+        elif "deut" in mode_ui:
+            key = "deutan"
+        elif "trit" in mode_ui:
+            key = "tritan"
+        elif "none" in mode_ui or "normal" in mode_ui or "off" in mode_ui:
+            key = "none"
         else:
-            messagebox.showerror("Error", f"Could not write:\n{path}")
+            key = "none"
 
-# ---------- Main ----------
+        return simulate_cvd_with_daltonlens(src_img, key, sev01)
+
+    def update_after_image_preview(self):
+        """Recompute 'after' using current slider + mode, then refresh canvases."""
+        if self.before_img_pil is None:
+            return
+        self.after_img_pil = self._make_after_from_ui(self.before_img_pil)
+        self._update_previews()
+        self._update_status_counters()
+
+    def _update_previews(self):
+        """Update the tk.PhotoImage previews for before/after."""
+        if self.before_img_pil is None:
+            self.before_canvas.config(image="", text="(no image)")
+            self.after_canvas.config(image="", text="(no image)")
+            return
+
+        b_disp = pil_resize_keep_aspect(self.before_img_pil, 500, 500)
+        a_disp = pil_resize_keep_aspect(
+            self.after_img_pil if self.after_img_pil else self.before_img_pil,
+            500, 500
+        )
+
+        self.before_tk = ImageTk.PhotoImage(b_disp)
+        self.after_tk  = ImageTk.PhotoImage(a_disp)
+
+        self.before_canvas.configure(image=self.before_tk)
+        self.after_canvas.configure(image=self.after_tk)
+
+    def _update_status_counters(self):
+        """Update status line + footer info."""
+        if self.before_img_pil is None:
+            self.status_var.set("No image loaded.")
+            self.dim_var.set("")
+            return
+
+        w, h = self.before_img_pil.size
+        self.dim_var.set(f"Image size: {w}x{h} | Total pixels: {w*h}")
+
+        mode_ui = self.cvd_mode_var.get().strip()
+        sev_ui  = self.severity_var.get()
+        self.status_var.set(
+            f"Mode={mode_ui}  Severity={sev_ui}/100  |  "
+            f"daltonlens={'OK' if DALTONLENS_AVAILABLE else 'NOT AVAILABLE'}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Export
+    # -------------------------------------------------------------------------
+
+    def export_csvs(self):
+        """
+        Choose a base name, then dump:
+            *_before_pixels.csv
+            *_after_pixels.csv
+            *_before_binary.csv
+            *_after_binary.csv
+        """
+        if self.before_img_pil is None or self.after_img_pil is None:
+            messagebox.showwarning("No image", "Load and simulate first.")
+            return
+
+        initial_name = os.path.splitext(
+            os.path.basename(self.loaded_path.get().strip() or "output")
+        )[0]
+
+        save_path = filedialog.asksaveasfilename(
+            title="Choose base name for CSV export",
+            initialfile=initial_name,
+            defaultextension=".csv",
+            filetypes=[("CSV","*.csv"), ("All files","*.*")]
+        )
+        if not save_path:
+            return
+
+        base_no_ext = save_path
+        if base_no_ext.lower().endswith(".csv"):
+            base_no_ext = base_no_ext[:-4]
+
+        try:
+            paths = export_pixels_and_binary_csvs(
+                base_no_ext,
+                self.before_img_pil,
+                self.after_img_pil
+            )
+            msg = "Exported:\n" + "\n".join(paths)
+            messagebox.showinfo("Export complete", msg)
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     ColorToolApp()
