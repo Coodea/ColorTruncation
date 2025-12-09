@@ -1,0 +1,2 @@
+The frequency files show the unique strings and their occurances in the files. They go from most occurances to least.
+The mapping files show what each binary string turns into and the amount of times it happens. It goes from most to least occurance for each string set.

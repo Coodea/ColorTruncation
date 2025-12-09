@@ -2,7 +2,7 @@
 """
 cvd_analyzer_gui.py
 -------------------
-CVD (color vision deficiency) simulation + binary frequency analyzer.
+CVD (color vision deficiency) simulation + binary frequency + delta operation stats.
 
 Features:
 - Open image
@@ -15,6 +15,10 @@ Features:
     * 00000000 excluded from listing and from % denominator
 - Export per-channel frequency CSVs (binary + decimal)
 - Export per-channel BEFORE→AFTER mapping CSVs
+- Export per-channel delta operation stats CSVs:
+    Operation = IDENTITY / ADDITION / SUBTRACTION,
+    rows = delta value (e.g. +1, -2) with
+           Count, % of Operation, % of Channel
 - Show per-channel top-20 bar graphs
 """
 
@@ -42,9 +46,10 @@ def image_to_8bit_binary(img: Image.Image):
 
 def analyze_channel(rows, channel):
     """
-    Count unique 8-bit strings in chosen channel.
-    Excludes ZERO from listing and from percentage denominator.
-    Returns:
+    Count unique 8-bit strings in chosen channel (AFTER image).
+
+    - Excludes ZERO from listing and from percentage denominator.
+    - Returns:
         freq          : list of (binary_str, count, pct)
         total_all     : total entries including zeros
         total_nonzero : total entries excluding zeros (percent base)
@@ -79,7 +84,7 @@ class CVDAnalyzerGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CVD Filter + Binary Frequency Analyzer")
-        self.root.geometry("1300x860")
+        self.root.geometry("1350x880")
 
         self.img_before = None
         self.img_after = None
@@ -105,7 +110,7 @@ class CVDAnalyzerGUI:
 
         # Row 0: open + path
         tk.Button(top, text="Open Image", command=self.load_image).grid(row=0, column=0, padx=5)
-        tk.Entry(top, textvariable=self.image_path, width=80).grid(row=0, column=1, columnspan=6, padx=5, sticky="we")
+        tk.Entry(top, textvariable=self.image_path, width=90).grid(row=0, column=1, columnspan=7, padx=5, sticky="we")
 
         # Row 1: filters, severity, exports
         for i, m in enumerate(("Deuteranopia", "Protanopia", "Tritanopia")):
@@ -123,8 +128,10 @@ class CVDAnalyzerGUI:
             .grid(row=1, column=5, padx=5)
         tk.Button(top, text="Export Mapping CSVs", command=self.export_mapping_csvs)\
             .grid(row=1, column=6, padx=5)
-        tk.Button(top, text="Show Graphs", command=self.show_graphs)\
+        tk.Button(top, text="Export Operation Stats", command=self.export_operation_stats)\
             .grid(row=1, column=7, padx=5)
+        tk.Button(top, text="Show Graphs", command=self.show_graphs)\
+            .grid(row=1, column=8, padx=5)
 
         # Image preview frame
         frame_imgs = tk.Frame(self.root)
@@ -231,7 +238,6 @@ class CVDAnalyzerGUI:
         if not base:
             return
 
-        # Strip .csv so we can append our suffixes
         if base.lower().endswith(".csv"):
             base = base[:-4]
 
@@ -310,11 +316,9 @@ class CVDAnalyzerGUI:
                     # Iterate over BEFORE values in sorted order
                     for b in sorted(before_totals.keys()):
                         total_b = before_totals[b]
-                        # collect all AFTER values for this BEFORE
                         after_dict = {
                             a: c for (bb, a), c in pair_counts.items() if bb == b
                         }
-                        # sort AFTER by count (descending), then by binary
                         for a, cnt in sorted(after_dict.items(),
                                              key=lambda x: (-x[1], x[0])):
                             pct = 100.0 * cnt / total_b if total_b else 0.0
@@ -325,8 +329,172 @@ class CVDAnalyzerGUI:
             messagebox.showerror("Error", str(e))
 
     # ---------------------------------------------------------------
+    def compute_operation_stats(self):
+        """
+        Compute delta operation statistics BETWEEN BEFORE and AFTER.
+
+        For each channel:
+            - total_pixels
+            - for each op in {IDENTITY, ADDITION, SUBTRACTION}:
+                  total_count, pct_of_channel,
+                  rows = list of (delta_value, count, % of op, % of channel)
+
+        Includes assertions to ensure internal consistency.
+        """
+        if not self.img_before or not self.img_after:
+            raise RuntimeError("Images not loaded")
+
+        arr_before = np.array(self.img_before.convert("RGB"), dtype=np.int16)
+        arr_after  = np.array(self.img_after.convert("RGB"), dtype=np.int16)
+
+        if arr_before.shape != arr_after.shape:
+            raise RuntimeError("Before and After images differ in size")
+
+        delta = arr_after - arr_before  # shape (h, w, 3)
+        h, w, _ = delta.shape
+        total_pixels = h * w
+
+        stats = {}
+
+        for ch, idx in (("R", 0), ("G", 1), ("B", 2)):
+            d = delta[:, :, idx].reshape(-1)
+            counts = Counter(d)
+
+            # Sanity: total_pixels must equal sum of all counts
+            assert sum(counts.values()) == total_pixels, "Count mismatch in channel " + ch
+
+            totals_op = {"IDENTITY": 0, "ADDITION": 0, "SUBTRACTION": 0}
+
+            # First accumulate total per operation
+            for val, cnt in counts.items():
+                if val == 0:
+                    op = "IDENTITY"
+                elif val > 0:
+                    op = "ADDITION"
+                else:
+                    op = "SUBTRACTION"
+                totals_op[op] += cnt
+
+            # Sanity: operations must partition the channel
+            assert sum(totals_op.values()) == total_pixels, "Op totals mismatch in channel " + ch
+
+            op_details = {}
+            for op in ("IDENTITY", "ADDITION", "SUBTRACTION"):
+                total_op = totals_op[op]
+                rows = []
+                if total_op > 0:
+                    if op == "IDENTITY":
+                        # Only delta 0
+                        val = 0
+                        cnt = counts.get(0, 0)
+                        if cnt > 0:
+                            pct_op = 100.0 * cnt / total_op
+                            pct_ch = 100.0 * cnt / total_pixels
+                            rows.append((val, cnt, pct_op, pct_ch))
+                    else:
+                        if op == "ADDITION":
+                            iter_items = [(v, c) for v, c in counts.items() if v > 0]
+                        else:
+                            iter_items = [(v, c) for v, c in counts.items() if v < 0]
+
+                        # sort by count descending, then by delta value
+                        iter_items.sort(key=lambda x: (-x[1], x[0]))
+                        for val, cnt in iter_items:
+                            if cnt <= 0:
+                                continue
+                            pct_op = 100.0 * cnt / total_op
+                            pct_ch = 100.0 * cnt / total_pixels
+                            rows.append((val, cnt, pct_op, pct_ch))
+
+                    # Sanity: sum of counts in rows must equal total_op
+                    assert sum(r[1] for r in rows) == total_op, f"Row sum mismatch in {ch} {op}"
+
+                op_details[op] = {
+                    "total_count": total_op,
+                    "pct_channel": 100.0 * total_op / total_pixels if total_pixels else 0.0,
+                    "rows": rows,
+                }
+
+            stats[ch] = {
+                "total_pixels": total_pixels,
+                "operations": op_details,
+            }
+
+        return stats
+
+    # ---------------------------------------------------------------
+    def export_operation_stats(self):
+        """
+        Export per-channel delta operation stats as CSVs.
+
+        For each channel (R/G/B) produce:
+            <base>_<mode>_sevXXX_<ch>_ops.csv
+
+        Each file contains sections:
+
+            Channel, R
+            Total pixels, N
+
+            Operation, ADDITION
+            Total Count, <n_add>, Percent of Channel, xx.xx%
+            Value (delta), Count, % of Operation, % of Channel
+            +1, 3763, 17.81%, 4.90%
+            ...
+
+        And similarly for SUBTRACTION and IDENTITY.
+        """
+        if not self.img_before or not self.img_after:
+            messagebox.showinfo("No data", "Load image and compute CVD first.")
+            return
+
+        base = filedialog.asksaveasfilename(
+            title="Export operation stats CSVs (base name)",
+            defaultextension=".csv"
+        )
+        if not base:
+            return
+        if base.lower().endswith(".csv"):
+            base = base[:-4]
+
+        mode = self.filter_mode.get().lower()
+        sev = int(float(self.severity.get()) * 100)
+
+        try:
+            stats = self.compute_operation_stats()
+
+            for ch, ch_info in stats.items():
+                path = f"{base}_{mode}_sev{sev:03d}_{ch}_ops.csv"
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+
+                    total_pixels = ch_info["total_pixels"]
+                    w.writerow(["Channel", ch])
+                    w.writerow(["Total pixels", total_pixels])
+                    w.writerow([])
+
+                    for op in ("IDENTITY", "ADDITION", "SUBTRACTION"):
+                        op_info = ch_info["operations"][op]
+                        total_op = op_info["total_count"]
+                        pct_ch_op = op_info["pct_channel"]
+
+                        w.writerow(["Operation", op])
+                        w.writerow(["Total Count", total_op, "Percent of Channel", f"{pct_ch_op:.2f}%"])
+                        w.writerow(["Value (delta)", "Count", "% of Operation", "% of Channel"])
+
+                        for val, cnt, pct_op, pct_ch in op_info["rows"]:
+                            label = f"{val:+d}" if val != 0 else "0"
+                            w.writerow([label, cnt, f"{pct_op:.2f}%", f"{pct_ch:.2f}%"])
+                        w.writerow([])  # blank line between operations
+
+            messagebox.showinfo("Done", "Exported per-channel operation stats CSVs.")
+        except AssertionError as ae:
+            messagebox.showerror("Assertion error", f"Internal consistency check failed:\n{ae}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---------------------------------------------------------------
     def show_graphs(self):
-        """Show bar plots of top-20 values for each channel."""
+        """Show bar plots of top-20 values for each channel (AFTER image)."""
         if not self.freq_results:
             messagebox.showinfo("No data", "Compute frequencies first.")
             return
